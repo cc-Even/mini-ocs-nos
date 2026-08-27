@@ -43,8 +43,10 @@ def _copy_path(path: gnmi_pb2.Path) -> gnmi_pb2.Path:
     return copied
 
 
-def _validate_models(request: gnmi_pb2.GetRequest) -> None:
-    for model in request.use_models:
+def validate_models(models) -> None:
+    """Validate a request's optional native model restrictions."""
+
+    for model in models:
         if model.name != MODEL_NAME:
             raise InvalidArgumentError(f"unsupported model {model.name!r}")
         if model.organization and model.organization != MODEL_ORGANIZATION:
@@ -84,7 +86,7 @@ class GetTransaction:
         paths = parse_paths(request.path, prefix=request.prefix)
         if request.encoding != gnmi_pb2.JSON_IETF:
             raise InvalidArgumentError("GetRequest encoding must be JSON_IETF")
-        _validate_models(request)
+        validate_models(request.use_models)
         for path in paths:
             _validate_type(path, request.type)
 

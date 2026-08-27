@@ -57,6 +57,11 @@ public:
         const std::string& field,
         long long increment = 1);
     [[nodiscard]] bool deleteKey(const std::string& key);
+    void replaceHashAndAppendEvent(
+        const std::string& key,
+        const std::map<std::string, std::string>& fields,
+        const std::string& stream,
+        const EventEnvelope& event);
 
     [[nodiscard]] std::string appendEvent(const std::string& stream, const EventEnvelope& event);
     void createConsumerGroup(

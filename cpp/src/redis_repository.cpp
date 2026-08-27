@@ -53,6 +53,16 @@ EventEnvelope parseEvent(const FieldMap& fields) {
     };
 }
 
+void validateEvent(const EventEnvelope& event) {
+    if (event.event_schema_version != 1) {
+        throw std::invalid_argument("unsupported Redis event schema version");
+    }
+    if (event.event_id.empty() || event.request_id.empty() || event.device.empty() ||
+        event.resource_type.empty() || event.resource_id.empty() || event.operation.empty()) {
+        throw std::invalid_argument("Redis event is missing a required envelope field");
+    }
+}
+
 }  // namespace
 
 class RedisRepository::Impl {
@@ -114,14 +124,24 @@ bool RedisRepository::deleteKey(const std::string& key) {
     return impl_->redis.del(key) == 1;
 }
 
+void RedisRepository::replaceHashAndAppendEvent(
+    const std::string& key,
+    const std::map<std::string, std::string>& fields,
+    const std::string& stream,
+    const EventEnvelope& event) {
+    validateEvent(event);
+    const auto event_fields = eventFields(event);
+    auto transaction = impl_->redis.transaction();
+    transaction.del(key);
+    if (!fields.empty()) {
+        transaction.hmset(key, fields.begin(), fields.end());
+    }
+    transaction.xadd(stream, "*", event_fields.begin(), event_fields.end());
+    static_cast<void>(transaction.exec());
+}
+
 std::string RedisRepository::appendEvent(const std::string& stream, const EventEnvelope& event) {
-    if (event.event_schema_version != 1) {
-        throw std::invalid_argument("unsupported Redis event schema version");
-    }
-    if (event.event_id.empty() || event.request_id.empty() || event.device.empty() ||
-        event.resource_type.empty() || event.resource_id.empty() || event.operation.empty()) {
-        throw std::invalid_argument("Redis event is missing a required envelope field");
-    }
+    validateEvent(event);
     const auto fields = eventFields(event);
     return impl_->redis.xadd(stream, "*", fields.begin(), fields.end());
 }

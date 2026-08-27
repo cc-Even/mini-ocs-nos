@@ -112,9 +112,11 @@ batch:
 
 Successful UPSERT commands replace `OCS_CONNECTION_STATE|device|id` in
 STATE_DB with the confirmed ports, desired/applied versions, and `ACTIVE`
-status. Successful REMOVE commands delete that state key; removing an already
-absent device connection is an idempotent success so a delete can converge
-after an older create fails. Every attempt
+status. Each state replacement or deletion and its compatible UPSERT or REMOVE
+entry in `OCS_STATE_EVENTS` occur in one STATE_DB transaction. Successful
+REMOVE commands delete that state key; removing an already absent device
+connection is an idempotent success so a delete can converge after an older
+create fails. Every attempt
 increments `device_apply_total` and one of `device_apply_success_total` or
 `device_apply_failure_total` in `OCS_DEVICE_COUNTERS|device` in COUNTERS_DB.
 If an update or delete fails, syncd retains the last confirmed actual ports and
@@ -167,3 +169,23 @@ orch publishes the newer command in stream order and keeps the resource in the
 appropriate executing state. The older result is then treated as stale, so
 rapid consecutive updates do not terminate the service or overwrite the latest
 application version.
+
+## gNMI ON_CHANGE subscriptions
+
+The MVP subscription surface accepts STREAM lists using JSON_IETF and
+ON_CHANGE (or TARGET_DEFINED, resolved to ON_CHANGE) for connection-state,
+input/output-port-state, and active-alarm paths and their containers. SAMPLE,
+ONCE, POLL, heartbeat, suppression, aggregation, and QoS options are rejected
+before Redis is read.
+
+For each client, the server captures the relevant stream tail before reading
+the baseline snapshots. It sends existing snapshots in request order unless
+`updates_only` is set, emits `sync_response=true`, and then tails
+`OCS_STATE_EVENTS` and/or `OCS_ALARM_EVENTS`. Capturing the cursor first and
+deduplicating authoritative snapshot payloads prevents a snapshot-to-stream
+race from losing a change or emitting a duplicate. An event is only a change
+signal: the notification value is reread from the authoritative snapshot DB.
+A missing snapshot after a matching event produces a gNMI delete. Malformed or
+unsupported stream envelopes are skipped after advancing the client cursor.
+Client cancellation cancels both request-monitor and bounded Redis-read tasks;
+the shared service clients are closed during server shutdown.

@@ -32,6 +32,10 @@ std::string resultPayload(const ApplyResult& result) {
     }.dump();
 }
 
+std::string statePayload(const std::map<std::string, std::string>& fields) {
+    return nlohmann::json(fields).dump();
+}
+
 }  // namespace
 
 SyncdService::SyncdService(redis::RedisEndpoint endpoint, std::unique_ptr<OcsDeviceApi> device)
@@ -137,13 +141,12 @@ void SyncdService::publishState(
     const ApplyResult& result) {
     for (const auto& command : batch.commands) {
         const auto state_key = redis::connectionStateKey(command_event.device, command.id);
+        std::map<std::string, std::string> state;
+        std::string operation = "UPSERT";
         if (result.ok() && command.operation == ConnectionOperation::kRemove) {
-            static_cast<void>(state_db_.deleteKey(state_key));
-            continue;
-        }
-
-        if (!result.ok()) {
-            auto state = state_db_.getHash(state_key);
+            operation = "REMOVE";
+        } else if (!result.ok()) {
+            state = state_db_.getHash(state_key);
             if (state.empty()) {
                 state = {
                     {"device", command_event.device},
@@ -157,19 +160,15 @@ void SyncdService::publishState(
             state["apply_status"] = "FAILED";
             state["last_error_code"] = std::string(toString(result.error.code));
             state["last_error_message"] = result.error.message;
-            state_db_.putHash(state_key, state);
-            continue;
-        }
-
-        const auto applied = std::ranges::find_if(result.connections, [&command](const auto& item) {
-            return item.id == command.id;
-        });
-        if (applied == result.connections.end()) {
-            throw std::runtime_error("successful device apply omitted connection result");
-        }
-        state_db_.putHash(
-            state_key,
-            {
+        } else {
+            const auto applied =
+                std::ranges::find_if(result.connections, [&command](const auto& item) {
+                    return item.id == command.id;
+                });
+            if (applied == result.connections.end()) {
+                throw std::runtime_error("successful device apply omitted connection result");
+            }
+            state = {
                 {"device", command_event.device},
                 {"id", command.id},
                 {"input_port", std::to_string(command.input_port)},
@@ -179,7 +178,26 @@ void SyncdService::publishState(
                 {"apply_status", "ACTIVE"},
                 {"last_error_code", std::string(toString(result.error.code))},
                 {"last_error_message", result.error.message},
-            });
+            };
+        }
+
+        const redis::EventEnvelope state_event{
+            .event_schema_version = 1,
+            .event_id = command_event.event_id + ":state:" + command.id,
+            .request_id = command_event.request_id,
+            .timestamp_ns = timestampNowNs(),
+            .device = command_event.device,
+            .resource_type = "connection",
+            .resource_id = command.id,
+            .operation = operation,
+            .desired_version = command.desired_version,
+            .payload = statePayload(state),
+        };
+        state_db_.replaceHashAndAppendEvent(
+            state_key,
+            state,
+            std::string(redis::kStateEvents),
+            state_event);
     }
 }
 

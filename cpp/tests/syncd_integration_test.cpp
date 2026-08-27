@@ -86,7 +86,9 @@ protected:
 
 TEST_F(SyncdIntegrationTest, AppliesCommandPublishesStateAndResultThenAcknowledges) {
     const std::string result_group = "result-test";
+    const std::string state_group = "state-test";
     device_db_->createConsumerGroup(std::string(ocs::redis::kDeviceResults), result_group);
+    state_db_->createConsumerGroup(std::string(ocs::redis::kStateEvents), state_group);
     const ocs::DeviceCommandBatch command_batch{
         .commands = {{
             .id = "conn-001",
@@ -122,6 +124,14 @@ TEST_F(SyncdIntegrationTest, AppliesCommandPublishesStateAndResultThenAcknowledg
     EXPECT_EQ(state.at("apply_status"), "ACTIVE");
     EXPECT_EQ(state.at("desired_version"), "7");
     EXPECT_EQ(state.at("applied_version"), "7");
+
+    const auto state_events = state_db_->readGroup(
+        std::string(ocs::redis::kStateEvents), state_group, "state-consumer");
+    ASSERT_EQ(state_events.size(), 1);
+    EXPECT_EQ(state_events.front().event.resource_type, "connection");
+    EXPECT_EQ(state_events.front().event.resource_id, "conn-001");
+    EXPECT_EQ(state_events.front().event.operation, "UPSERT");
+    EXPECT_EQ(state_events.front().event.desired_version, 7);
 
     const auto counters = counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"));
     EXPECT_EQ(counters.at("device_apply_total"), "1");

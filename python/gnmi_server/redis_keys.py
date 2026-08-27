@@ -7,6 +7,8 @@ COUNTERS_DB: Final = 2
 STATE_DB: Final = 6
 ALARM_DB: Final = 8
 CONFIG_EVENTS: Final = "OCS_CONFIG_EVENTS"
+STATE_EVENTS: Final = "OCS_STATE_EVENTS"
+ALARM_EVENTS: Final = "OCS_ALARM_EVENTS"
 
 
 def device_config_key(device: str) -> str:

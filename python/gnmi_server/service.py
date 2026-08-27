@@ -15,6 +15,8 @@ from gnmi_server.get_transaction import GetTransaction
 from gnmi_server.proto import gnmi_pb2, gnmi_pb2_grpc
 from gnmi_server.redis_repository import RedisConfigRepository
 from gnmi_server.set_transaction import SetOperationKind, SetTransaction
+from gnmi_server.subscribe_repository import RedisSubscribeRepository
+from gnmi_server.subscribe_transaction import SubscribeTransaction
 
 MODEL_NAME: Final = "mini-ocs-native"
 MODEL_ORGANIZATION: Final = "mini-ocs-nos"
@@ -29,12 +31,20 @@ class GnmiService(gnmi_pb2_grpc.gNMIServicer):
         self,
         set_transaction: SetTransaction | None = None,
         get_transaction: GetTransaction | None = None,
+        subscribe_transaction: SubscribeTransaction | None = None,
     ) -> None:
         self._set_transaction = set_transaction or SetTransaction(RedisConfigRepository())
         self._get_transaction = get_transaction or GetTransaction(RedisGetRepository())
+        self._subscribe_transaction = subscribe_transaction or SubscribeTransaction(
+            RedisSubscribeRepository()
+        )
 
     async def close(self) -> None:
-        await asyncio.gather(self._set_transaction.close(), self._get_transaction.close())
+        await asyncio.gather(
+            self._set_transaction.close(),
+            self._get_transaction.close(),
+            self._subscribe_transaction.close(),
+        )
 
     async def Capabilities(
         self,
@@ -98,9 +108,8 @@ class GnmiService(gnmi_pb2_grpc.gNMIServicer):
         request_iterator: AsyncIterator[gnmi_pb2.SubscribeRequest],
         context: grpc.aio.ServicerContext,
     ) -> AsyncIterator[gnmi_pb2.SubscribeResponse]:
-        del request_iterator
-        await context.abort(
-            grpc.StatusCode.UNIMPLEMENTED,
-            "Subscribe is not implemented in Iteration 32",
-        )
-        yield gnmi_pb2.SubscribeResponse()
+        try:
+            async for response in self._subscribe_transaction.stream(request_iterator):
+                yield response
+        except Exception as error:
+            await abort_rpc(context, error)
