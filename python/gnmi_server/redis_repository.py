@@ -157,7 +157,7 @@ class RedisConfigRepository:
                 input_port_count=input_count,
                 output_port_count=output_count,
             )
-            await self._validate_ports_enabled(pipe, plan.device, candidate.changes)
+            await self._validate_ports_enabled(pipe, plan.device, candidate.connections)
 
             if not candidate.changes:
                 await pipe.unwatch()
@@ -221,12 +221,11 @@ class RedisConfigRepository:
         self,
         pipe,
         device: str,
-        changes: tuple[CandidateChange, ...],
+        connections: tuple[ConnectionConfig, ...],
     ) -> None:
         ports = {
-            (change.config.input_port, change.config.output_port)
-            for change in changes
-            if change.config is not None
+            (connection.input_port, connection.output_port)
+            for connection in connections
         }
         keys = [
             key

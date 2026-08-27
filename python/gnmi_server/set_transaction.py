@@ -101,6 +101,7 @@ class CandidateMutation:
     revision: int
     timestamp_ns: int
     changes: tuple[CandidateChange, ...]
+    connections: tuple[ConnectionConfig, ...]
 
 
 @dataclass(frozen=True)
@@ -365,6 +366,7 @@ def build_candidate(
         revision=revision,
         timestamp_ns=timestamp_ns,
         changes=tuple(changes),
+        connections=tuple(finalized[connection_id] for connection_id in sorted(finalized)),
     )
 
 

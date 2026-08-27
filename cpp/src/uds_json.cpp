@@ -161,6 +161,7 @@ std::string encodeApplyRequest(
         {"commands", std::move(command_values)},
         {"atomic", options.atomic},
         {"timeout_ms", options.timeout.count()},
+        {"operation_id", options.operation_id},
     }.dump();
 }
 
@@ -169,6 +170,7 @@ ApplyRequest decodeApplyRequest(const std::string& payload) {
     ApplyRequest result;
     result.options.atomic = value.at("atomic").get<bool>();
     result.options.timeout = std::chrono::milliseconds(value.at("timeout_ms").get<std::int64_t>());
+    result.options.operation_id = value.value("operation_id", "");
     for (const auto& command : value.at("commands")) {
         result.commands.push_back({
             .operation = parseOperation(command.at("operation").get<std::string>()),

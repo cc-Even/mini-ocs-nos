@@ -163,6 +163,46 @@ TEST(InProcessSimBackendTest, PreservesOldMatrixWhenInjectedApplyFails) {
     EXPECT_EQ(actual.front().id, "existing");
 }
 
+TEST(InProcessSimBackendTest, ReplaysOriginalFailureForDuplicateOperationId) {
+    auto backend = makeBackend();
+    ASSERT_TRUE(backend->injectFault({.type = ocs::FaultType::kNextApplyError}).error.ok());
+    const std::vector<ocs::ConnectionCommand> commands{
+        {.id = "idempotent", .input_port = 2, .output_port = 10, .desired_version = 1},
+    };
+    const ocs::ApplyOptions first_options{
+        .operation_id = "operation-1",
+    };
+
+    const auto first = backend->applyConnections(commands, first_options);
+    const auto replay = backend->applyConnections(commands, first_options);
+    const auto new_operation = backend->applyConnections(
+        commands,
+        ocs::ApplyOptions{.operation_id = "operation-2"});
+
+    EXPECT_EQ(first.error.code, ocs::ErrorCode::kApplyFailed);
+    EXPECT_EQ(replay.error.code, ocs::ErrorCode::kApplyFailed);
+    EXPECT_TRUE(new_operation.ok());
+    ASSERT_EQ(backend->getConnections().size(), 1);
+}
+
+TEST(InProcessSimBackendTest, RejectsUncachedOlderVersionWithoutRollingBackMatrix) {
+    auto backend = makeBackend();
+    const auto newer = backend->applyConnections(
+        {{.id = "versioned", .input_port = 3, .output_port = 11, .desired_version = 2}},
+        ocs::ApplyOptions{.operation_id = "operation-newer"});
+    const auto older = backend->applyConnections(
+        {{.id = "versioned", .input_port = 4, .output_port = 12, .desired_version = 1}},
+        ocs::ApplyOptions{.operation_id = "operation-older"});
+
+    ASSERT_TRUE(newer.ok());
+    EXPECT_EQ(older.error.code, ocs::ErrorCode::kVersionStale);
+    const auto actual = backend->getConnections();
+    ASSERT_EQ(actual.size(), 1);
+    EXPECT_EQ(actual.front().input_port, 3);
+    EXPECT_EQ(actual.front().output_port, 11);
+    EXPECT_EQ(actual.front().applied_version, 2);
+}
+
 TEST(InProcessSimBackendTest, RejectsDownAndDisabledPorts) {
     auto device = std::make_shared<ocs::SimulatedOcsDevice>(defaultDeviceInfo());
     ocs::InProcessSimBackend backend(device);

@@ -3,7 +3,6 @@
 #include <sw/redis++/redis++.h>
 
 #include <iterator>
-#include <limits>
 #include <stdexcept>
 #include <tuple>
 #include <unordered_map>
@@ -15,6 +14,7 @@ namespace {
 using FieldMap = std::unordered_map<std::string, std::string>;
 using StreamItem = std::pair<std::string, FieldMap>;
 using StreamResult = std::unordered_map<std::string, std::vector<StreamItem>>;
+inline constexpr int kMaxWatchRetries = 8;
 
 std::vector<std::pair<std::string, std::string>> eventFields(const EventEnvelope& event) {
     return {
@@ -107,6 +107,31 @@ void RedisRepository::putHash(
     static_cast<void>(transaction.exec());
 }
 
+bool RedisRepository::putHashIfAbsent(
+    const std::string& key,
+    const std::map<std::string, std::string>& fields) {
+    if (fields.empty()) {
+        throw std::invalid_argument("conditional Redis hash fields must not be empty");
+    }
+    for (int attempt = 0; attempt < kMaxWatchRetries; ++attempt) {
+        auto transaction = impl_->redis.transaction();
+        auto watched = transaction.redis();
+        watched.watch(key);
+        if (watched.exists(key) != 0) {
+            watched.unwatch();
+            return false;
+        }
+        transaction.hmset(key, fields.begin(), fields.end());
+        try {
+            static_cast<void>(transaction.exec());
+            return true;
+        } catch (const sw::redis::WatchError&) {
+            continue;
+        }
+    }
+    throw std::runtime_error("Redis conditional hash write exceeded retry limit");
+}
+
 std::map<std::string, std::string> RedisRepository::getHash(const std::string& key) {
     std::map<std::string, std::string> result;
     impl_->redis.hgetall(key, std::inserter(result, result.end()));
@@ -149,7 +174,7 @@ bool RedisRepository::replaceHashAndAppendEventOnce(
     const EventEnvelope& event) {
     validateEvent(event);
     const auto event_fields = eventFields(event);
-    while (true) {
+    for (int attempt = 0; attempt < kMaxWatchRetries; ++attempt) {
         auto transaction = impl_->redis.transaction();
         auto watched = transaction.redis();
         watched.watch(marker_key);
@@ -170,6 +195,7 @@ bool RedisRepository::replaceHashAndAppendEventOnce(
             continue;
         }
     }
+    throw std::runtime_error("Redis state publication exceeded retry limit");
 }
 
 bool RedisRepository::appendEventOnce(
@@ -179,7 +205,7 @@ bool RedisRepository::appendEventOnce(
     const EventEnvelope& event) {
     validateEvent(event);
     const auto event_fields = eventFields(event);
-    while (true) {
+    for (int attempt = 0; attempt < kMaxWatchRetries; ++attempt) {
         auto transaction = impl_->redis.transaction();
         auto watched = transaction.redis();
         watched.watch(marker_key);
@@ -196,6 +222,7 @@ bool RedisRepository::appendEventOnce(
             continue;
         }
     }
+    throw std::runtime_error("Redis event publication exceeded retry limit");
 }
 
 bool RedisRepository::incrementHashFieldsOnce(
@@ -203,7 +230,7 @@ bool RedisRepository::incrementHashFieldsOnce(
     const std::map<std::string, std::string>& marker_fields,
     const std::string& key,
     const std::map<std::string, long long>& increments) {
-    while (true) {
+    for (int attempt = 0; attempt < kMaxWatchRetries; ++attempt) {
         auto transaction = impl_->redis.transaction();
         auto watched = transaction.redis();
         watched.watch(marker_key);
@@ -224,6 +251,7 @@ bool RedisRepository::incrementHashFieldsOnce(
             continue;
         }
     }
+    throw std::runtime_error("Redis counter publication exceeded retry limit");
 }
 
 void RedisRepository::putHashesAtomically(
@@ -344,16 +372,12 @@ long long RedisRepository::acknowledge(
 }
 
 long long RedisRepository::pendingCount(const std::string& stream, const std::string& group) {
-    using PendingEntry = std::tuple<std::string, std::string, long long, long long>;
-    std::vector<PendingEntry> pending;
-    impl_->redis.xpending(
-        stream,
-        group,
-        "-",
-        "+",
-        std::numeric_limits<long long>::max(),
-        std::back_inserter(pending));
-    return static_cast<long long>(pending.size());
+    std::vector<std::pair<std::string, std::string>> consumers;
+    const auto [count, first_id, last_id] =
+        impl_->redis.xpending(stream, group, std::back_inserter(consumers));
+    static_cast<void>(first_id);
+    static_cast<void>(last_id);
+    return count;
 }
 
 void RedisRepository::flushForTest() {

@@ -56,9 +56,12 @@ protected:
             std::make_unique<ocs::redis::RedisRepository>(endpoint_, ocs::redis::LogicalDb::kState);
         counters_db_ = std::make_unique<ocs::redis::RedisRepository>(
             endpoint_, ocs::redis::LogicalDb::kCounters);
+        config_db_ = std::make_unique<ocs::redis::RedisRepository>(
+            endpoint_, ocs::redis::LogicalDb::kConfig);
         device_db_->flushForTest();
         state_db_->flushForTest();
         counters_db_->flushForTest();
+        config_db_->flushForTest();
 
         auto backend = std::make_unique<ocs::UdsDeviceBackend>(hwsim_socket_);
         syncd_ = std::make_unique<ocs::SyncdService>(endpoint_, std::move(backend));
@@ -70,6 +73,7 @@ protected:
         device_db_.reset();
         state_db_.reset();
         counters_db_.reset();
+        config_db_.reset();
         if (hwsim_) {
             hwsim_->stop();
         }
@@ -85,10 +89,16 @@ protected:
     std::unique_ptr<ocs::redis::RedisRepository> device_db_;
     std::unique_ptr<ocs::redis::RedisRepository> state_db_;
     std::unique_ptr<ocs::redis::RedisRepository> counters_db_;
+    std::unique_ptr<ocs::redis::RedisRepository> config_db_;
     std::unique_ptr<ocs::SyncdService> syncd_;
 };
 
 TEST_F(SyncdIntegrationTest, AppliesCommandPublishesStateAndResultThenAcknowledges) {
+    const auto inventory = config_db_->getHash(ocs::redis::deviceConfigKey("ocs0"));
+    EXPECT_EQ(inventory.at("name"), "ocs0");
+    EXPECT_EQ(inventory.at("input_port_count"), "16");
+    EXPECT_EQ(inventory.at("output_port_count"), "16");
+
     const std::string result_group = "result-test";
     const std::string state_group = "state-test";
     device_db_->createConsumerGroup(std::string(ocs::redis::kDeviceResults), result_group);
@@ -431,6 +441,204 @@ TEST_F(SyncdIntegrationTest, RecoversIdempotentlyAfterEveryPersistenceBoundary) 
     EXPECT_EQ(counters.at("device_apply_success_total"), std::to_string(phases.size()));
     EXPECT_EQ(counters.at("active_connections"), std::to_string(phases.size()));
     EXPECT_EQ(simulated_device_->getConnections().size(), phases.size());
+}
+
+TEST_F(SyncdIntegrationTest, PreservesFailedApplyResultAcrossCrashRecovery) {
+    const std::string result_group = "failed-crash-result-test";
+    device_db_->createConsumerGroup(std::string(ocs::redis::kDeviceResults), result_group);
+    ASSERT_TRUE(simulated_device_->injectFault({.type = ocs::FaultType::kNextApplyError}).error.ok());
+    const ocs::DeviceCommandBatch batch{
+        .commands = {{
+            .id = "failed-crash",
+            .input_port = 7,
+            .output_port = 15,
+            .desired_version = 1,
+        }},
+        .options = {},
+    };
+    const ocs::redis::EventEnvelope event{
+        .event_schema_version = 1,
+        .event_id = "command-failed-crash",
+        .request_id = "request-failed-crash",
+        .timestamp_ns = 1780000000000000250ULL,
+        .device = "ocs0",
+        .resource_type = "connection",
+        .resource_id = "failed-crash",
+        .operation = "UPSERT",
+        .desired_version = 1,
+        .payload = ocs::encodeDeviceCommand(batch),
+    };
+    static_cast<void>(device_db_->appendEvent(
+        std::string(ocs::redis::kDeviceCommands), event));
+
+    struct SimulatedCrash {};
+    EXPECT_THROW(
+        static_cast<void>(syncd_->processOne(
+            "failed-crash-consumer",
+            {},
+            [](std::string_view phase) {
+                if (phase == "device-apply") {
+                    throw SimulatedCrash{};
+                }
+            })),
+        SimulatedCrash);
+
+    syncd_.reset();
+    syncd_ = std::make_unique<ocs::SyncdService>(
+        endpoint_,
+        std::make_unique<ocs::UdsDeviceBackend>(hwsim_socket_),
+        std::chrono::milliseconds(0));
+    syncd_->initialize();
+    ASSERT_TRUE(syncd_->processOne("failed-crash-recovery"));
+
+    EXPECT_TRUE(simulated_device_->getConnections().empty());
+    const auto state =
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "failed-crash"));
+    EXPECT_EQ(state.at("apply_status"), "FAILED");
+    EXPECT_EQ(state.at("last_error_code"), "OCS_APPLY_FAILED");
+    const auto counters = counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"));
+    EXPECT_EQ(counters.at("device_apply_total"), "1");
+    EXPECT_EQ(counters.at("device_apply_failure_total"), "1");
+    const auto results = device_db_->readGroup(
+        std::string(ocs::redis::kDeviceResults), result_group, "failed-result-consumer");
+    ASSERT_EQ(results.size(), 1);
+    EXPECT_NE(results.front().event.payload.find("OCS_APPLY_FAILED"), std::string::npos);
+}
+
+TEST_F(SyncdIntegrationTest, DrainsOlderPublishedPhasesBeforeReadingNewerVersion) {
+    const auto command_event = [](std::uint64_t version, ocs::PortId output) {
+        const ocs::DeviceCommandBatch batch{
+            .commands = {{
+                .id = "interleaved",
+                .input_port = 8,
+                .output_port = output,
+                .desired_version = version,
+            }},
+            .options = {},
+        };
+        return ocs::redis::EventEnvelope{
+            .event_schema_version = 1,
+            .event_id = "command-interleaved-" + std::to_string(version),
+            .request_id = "request-interleaved-" + std::to_string(version),
+            .timestamp_ns = 1780000000000000270ULL + version,
+            .device = "ocs0",
+            .resource_type = "connection",
+            .resource_id = "interleaved",
+            .operation = "UPSERT",
+            .desired_version = version,
+            .payload = ocs::encodeDeviceCommand(batch),
+        };
+    };
+    static_cast<void>(device_db_->appendEvent(
+        std::string(ocs::redis::kDeviceCommands), command_event(1, 15)));
+
+    struct SimulatedCrash {};
+    EXPECT_THROW(
+        static_cast<void>(syncd_->processOne(
+            "interleaved-v1",
+            {},
+            [](std::string_view phase) {
+                if (phase == "state") {
+                    throw SimulatedCrash{};
+                }
+            })),
+        SimulatedCrash);
+    static_cast<void>(device_db_->appendEvent(
+        std::string(ocs::redis::kDeviceCommands), command_event(2, 16)));
+    EXPECT_FALSE(syncd_->processOne("interleaved-v2-blocked"));
+
+    syncd_.reset();
+    syncd_ = std::make_unique<ocs::SyncdService>(
+        endpoint_,
+        std::make_unique<ocs::UdsDeviceBackend>(hwsim_socket_),
+        std::chrono::milliseconds(0));
+    syncd_->initialize();
+    ASSERT_TRUE(syncd_->processOne("interleaved-v1-recovery"));
+    ASSERT_TRUE(syncd_->processOne("interleaved-v2"));
+
+    const auto state =
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "interleaved"));
+    EXPECT_EQ(state.at("output_port"), "16");
+    EXPECT_EQ(state.at("applied_version"), "2");
+    const auto counters = counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"));
+    EXPECT_EQ(counters.at("device_apply_total"), "2");
+    EXPECT_EQ(counters.at("device_apply_success_total"), "2");
+    EXPECT_EQ(counters.at("active_connections"), "1");
+    const auto version = device_db_->getHash(
+        ocs::redis::syncdConnectionVersionKey("ocs0", "interleaved"));
+    EXPECT_EQ(version.at("last_successful_version"), "2");
+    const auto actual = simulated_device_->getConnections();
+    ASSERT_EQ(actual.size(), 1);
+    EXPECT_EQ(actual.front().output_port, 16);
+    EXPECT_EQ(actual.front().applied_version, 2);
+}
+
+TEST_F(SyncdIntegrationTest, DrainsOlderAttemptBeforeReadingNewerVersion) {
+    const auto command_event = [](std::uint64_t version, ocs::PortId output) {
+        const ocs::DeviceCommandBatch batch{
+            .commands = {{
+                .id = "attempt-interleaved",
+                .input_port = 9,
+                .output_port = output,
+                .desired_version = version,
+            }},
+            .options = {},
+        };
+        return ocs::redis::EventEnvelope{
+            .event_schema_version = 1,
+            .event_id = "command-attempt-interleaved-" + std::to_string(version),
+            .request_id = "request-attempt-interleaved-" + std::to_string(version),
+            .timestamp_ns = 1780000000000000290ULL + version,
+            .device = "ocs0",
+            .resource_type = "connection",
+            .resource_id = "attempt-interleaved",
+            .operation = "UPSERT",
+            .desired_version = version,
+            .payload = ocs::encodeDeviceCommand(batch),
+        };
+    };
+    static_cast<void>(device_db_->appendEvent(
+        std::string(ocs::redis::kDeviceCommands), command_event(1, 14)));
+
+    struct SimulatedCrash {};
+    EXPECT_THROW(
+        static_cast<void>(syncd_->processOne(
+            "attempt-interleaved-v1",
+            {},
+            [](std::string_view phase) {
+                if (phase == "device-apply") {
+                    throw SimulatedCrash{};
+                }
+            })),
+        SimulatedCrash);
+    static_cast<void>(device_db_->appendEvent(
+        std::string(ocs::redis::kDeviceCommands), command_event(2, 16)));
+    EXPECT_FALSE(syncd_->processOne("attempt-interleaved-v2-blocked"));
+
+    syncd_.reset();
+    syncd_ = std::make_unique<ocs::SyncdService>(
+        endpoint_,
+        std::make_unique<ocs::UdsDeviceBackend>(hwsim_socket_),
+        std::chrono::milliseconds(0));
+    syncd_->initialize();
+    ASSERT_TRUE(syncd_->processOne("attempt-interleaved-v1-recovery"));
+    ASSERT_TRUE(syncd_->processOne("attempt-interleaved-v2"));
+
+    const auto state = state_db_->getHash(
+        ocs::redis::connectionStateKey("ocs0", "attempt-interleaved"));
+    EXPECT_EQ(state.at("output_port"), "16");
+    EXPECT_EQ(state.at("applied_version"), "2");
+    const auto counters = counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"));
+    EXPECT_EQ(counters.at("device_apply_total"), "2");
+    EXPECT_EQ(counters.at("device_apply_success_total"), "2");
+    EXPECT_EQ(counters.at("active_connections"), "1");
+    const auto version = device_db_->getHash(
+        ocs::redis::syncdConnectionVersionKey("ocs0", "attempt-interleaved"));
+    EXPECT_EQ(version.at("last_successful_version"), "2");
+    const auto actual = simulated_device_->getConnections();
+    ASSERT_EQ(actual.size(), 1);
+    EXPECT_EQ(actual.front().output_port, 16);
+    EXPECT_EQ(actual.front().applied_version, 2);
 }
 
 TEST_F(SyncdIntegrationTest, RejectsCommandForDifferentConnectedDevice) {

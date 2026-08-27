@@ -7,6 +7,7 @@ import os
 import grpc
 import pytest
 import redis.asyncio as redis_async
+from gnmi_server.errors import ConflictError
 from gnmi_server.path_parser import protobuf_path
 from gnmi_server.proto import gnmi_pb2, gnmi_pb2_grpc
 from gnmi_server.redis_keys import (
@@ -16,6 +17,7 @@ from gnmi_server.redis_keys import (
     connection_config_key,
     device_config_key,
     input_port_config_key,
+    output_port_config_key,
 )
 from gnmi_server.redis_repository import RedisConfigRepository, RedisSettings
 from gnmi_server.server import create_server
@@ -203,6 +205,10 @@ async def test_set_rejects_unknown_device_and_disabled_port_without_writes() -> 
             assert disabled.value.code() is grpc.StatusCode.INVALID_ARGUMENT
             assert "administratively disabled" in disabled.value.details()
 
+            await observer.hset(
+                input_port_config_key("ocs0", 1),
+                mapping={"admin_status": "ENABLED"},
+            )
             for _ in range(2):
                 deleted = await stub.Set(
                     gnmi_pb2.SetRequest(delete=[_config_path("missing")]),
@@ -211,11 +217,77 @@ async def test_set_rejects_unknown_device_and_disabled_port_without_writes() -> 
                 assert [response.op for response in deleted.response] == [
                     gnmi_pb2.UpdateResult.DELETE
                 ]
-            assert await observer.xlen(CONFIG_EVENTS) == 0
-            assert await observer.get(config_revision_key("ocs0")) is None
+
+            await stub.Set(
+                gnmi_pb2.SetRequest(update=[_update("existing", 1, 9)]),
+                timeout=2.0,
+            )
+            await observer.hset(
+                output_port_config_key("ocs0", 9),
+                mapping={"admin_status": "DISABLED"},
+            )
+            for request in (
+                gnmi_pb2.SetRequest(update=[_update("existing", 1, 9)]),
+                gnmi_pb2.SetRequest(update=[_update("unrelated", 2, 10)]),
+            ):
+                with pytest.raises(grpc.aio.AioRpcError) as final_candidate:
+                    await stub.Set(request, timeout=2.0)
+                assert final_candidate.value.code() is grpc.StatusCode.INVALID_ARGUMENT
+                assert "output port 9" in final_candidate.value.details()
+
+            assert await observer.xlen(CONFIG_EVENTS) == 1
+            assert await observer.get(config_revision_key("ocs0")) == "1"
         finally:
             await channel.close()
             await server.stop(0.5)
             await service.close()
     finally:
+        await observer.aclose()
+
+
+async def test_port_admin_change_racing_commit_is_revalidated() -> None:
+    socket_path = os.environ["OCS_REDIS_SOCKET"]
+    settings = RedisSettings(unix_socket=socket_path)
+    observer = redis_async.Redis(
+        unix_socket_path=socket_path,
+        db=CONFIG_DB,
+        decode_responses=True,
+        socket_connect_timeout=1.0,
+        socket_timeout=1.0,
+    )
+
+    class RacingRepository(RedisConfigRepository):
+        raced = False
+
+        async def _validate_ports_enabled(self, pipe, device, connections) -> None:
+            await super()._validate_ports_enabled(pipe, device, connections)
+            if not self.raced:
+                self.raced = True
+                await observer.hset(
+                    output_port_config_key(device, 9),
+                    mapping={"admin_status": "DISABLED"},
+                )
+
+    repository = RacingRepository(settings)
+    await repository.flush_for_test()
+    await observer.hset(
+        device_config_key("ocs0"),
+        mapping={
+            "name": "ocs0",
+            "input_port_count": "16",
+            "output_port_count": "16",
+        },
+    )
+    try:
+        transaction = SetTransaction(repository)
+        with pytest.raises(ConflictError, match="output port 9"):
+            await transaction.apply(
+                gnmi_pb2.SetRequest(update=[_update("racing", 1, 9)])
+            )
+        assert repository.raced is True
+        assert await observer.xlen(CONFIG_EVENTS) == 0
+        assert await observer.get(config_revision_key("ocs0")) is None
+        assert not await observer.exists(connection_config_key("ocs0", "racing"))
+    finally:
+        await repository.close()
         await observer.aclose()

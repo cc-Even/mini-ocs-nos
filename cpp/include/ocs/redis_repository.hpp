@@ -52,6 +52,9 @@ public:
 
     void ping();
     void putHash(const std::string& key, const std::map<std::string, std::string>& fields);
+    [[nodiscard]] bool putHashIfAbsent(
+        const std::string& key,
+        const std::map<std::string, std::string>& fields);
     [[nodiscard]] std::map<std::string, std::string> getHash(const std::string& key);
     [[nodiscard]] long long incrementHashField(
         const std::string& key,

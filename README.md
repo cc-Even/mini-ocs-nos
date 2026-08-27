@@ -28,6 +28,10 @@ the change. Use Get, `connection create --wait-active`, or
 `connection watch` to confirm `apply-status=ACTIVE` and matching desired/applied
 versions.
 
+Start `ocs-hwsim` and `ocs-syncd` before accepting configuration. During syncd
+startup, the backend handshake initializes the valid device inventory in
+CONFIG_DB; gNMI rejects device names that were not discovered this way.
+
 After `make build`, start the management server with `gnmi-server` and inspect
 the CLI with:
 

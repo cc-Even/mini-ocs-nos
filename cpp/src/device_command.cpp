@@ -66,6 +66,7 @@ std::string encodeDeviceCommand(const DeviceCommandBatch& batch) {
         {"commands", std::move(commands)},
         {"atomic", batch.options.atomic},
         {"timeout_ms", batch.options.timeout.count()},
+        {"operation_id", batch.options.operation_id},
     }.dump();
 }
 
@@ -74,6 +75,7 @@ DeviceCommandBatch decodeDeviceCommand(const std::string& payload) {
     DeviceCommandBatch batch;
     batch.options.atomic = value.at("atomic").get<bool>();
     batch.options.timeout = std::chrono::milliseconds(value.at("timeout_ms").get<long long>());
+    batch.options.operation_id = value.value("operation_id", "");
     if (batch.options.timeout <= std::chrono::milliseconds::zero()) {
         throw std::invalid_argument("device command timeout must be positive");
     }

@@ -20,6 +20,8 @@ successfully applied resource version and
 Per-phase `OCS_DEVICE_APPLY_*` and `OCS_SYNCD_*_PUBLISHED` hashes make recovery
 of device execution, state, counters, and result publication independently
 idempotent.
+`OCS_ORCH_CONFIG_BATCH|event-id` preserves a prepared orchestration batch, and
+`OCS_ORCH_DEVICE_COMMAND_PUBLISHED|event-id` is its atomic outbox marker.
 
 Every stream message uses this v1 envelope:
 
@@ -56,11 +58,14 @@ This preserves monotonic resource versions across delete and later recreation.
 The writer watches the revision and uses bounded retries to prevent concurrent
 requests from losing updates.
 
-The target `OCS_DEVICE|device` must exist with explicit positive input and
-output port counts; its key identity must match the requested device. An
+At syncd startup, the backend handshake initializes a missing
+`OCS_DEVICE|device` inventory hash with the confirmed identity, dimensions, and
+model metadata. Existing inventory is preserved and must match the backend.
+The Set target must exist with explicit positive input and output port counts,
+and its key identity must match the requested device. An
 administratively disabled device, input port, or output port rejects the
-candidate. Device and referenced port keys are watched through commit so an
-administrative-state change cannot race validation.
+complete final candidate. Device and every candidate port key are watched
+through commit so an administrative-state change cannot race validation.
 
 One CONFIG_DB `MULTI/EXEC` replaces or deletes all affected
 `OCS_CONNECTION|device|id` hashes, advances the revision, and appends a
@@ -116,9 +121,16 @@ batch:
     }
   ],
   "atomic": true,
-  "timeout_ms": 1000
+  "timeout_ms": 1000,
+  "operation_id": "command-id"
 }
 ```
+
+syncd overwrites `operation_id` with the reliable command event ID. The device
+returns the first result for a repeated operation ID, including an original
+failure, and rejects an uncached resource version older than its last successful
+version. A response-lost retry therefore cannot repeat a hardware transition,
+turn a one-shot failure into success, or roll a newer matrix backward.
 
 Successful UPSERT commands replace `OCS_CONNECTION_STATE|device|id` in
 STATE_DB with the confirmed ports, desired/applied versions, and `ACTIVE`
@@ -154,13 +166,14 @@ version. These records survive an ordinary syncd restart.
 
 Before device execution, syncd writes an attempt record. The device result is
 then durably stored before Redis-derived side effects begin. If the process
-exits after hardware success but before storing that result, recovery compares
-the full atomic batch against the device's actual connections and does not
-repeat an already completed apply. State publication, counter increments, and
-each result event use their own atomic once marker. The processed-command marker
-and all successful per-resource version markers are written in one DEVICE_DB
-transaction. Therefore recovery can resume after any persistence boundary
-without losing or duplicating those effects.
+exits after the device call but before storing that result, recovery repeats the
+same operation ID and receives the original cached result. State publication,
+counter increments, and each result event use their own atomic once marker. A
+superseded phase cannot overwrite a newer state or version. The
+processed-command marker and all advancing per-resource version markers are
+written in one DEVICE_DB transaction. Malformed commands still produce an
+envelope-level failure result before ACK. Therefore recovery can resume after
+any persistence boundary without losing or duplicating those effects.
 
 Each syncd loop first performs a bounded XPENDING scan and XCLAIM for commands
 whose idle time exceeds `OCS_SYNCD_PENDING_MIN_IDLE_MS` (five seconds by
@@ -171,6 +184,11 @@ marker, and only acknowledges it. It does not reapply hardware, republish state
 or result events, or increment counters. Scenario E launches a process with the
 deterministic crash hook at that exact boundary and verifies all four side-effect
 counts remain one after recovery.
+While any pending command exists but is not old enough to claim, syncd does not
+read newer stream entries. This preserves command order and prevents a newer
+version from overtaking unfinished state or counter phases. Redis optimistic
+once operations retry WATCH conflicts at most eight times and retain the
+repository socket deadline.
 
 ## Orchestration contract
 
@@ -182,6 +200,15 @@ the event, advances each affected centralized connection state machine, writes
 `OCS_CONNECTION_APP|device|id` in APPL_DB, and emits the complete change set as
 one atomic batch to `OCS_DEVICE_COMMANDS` in DEVICE_DB. The command event ID is
 derived from the configuration event ID so the relationship remains traceable.
+
+Before changing APPL_DB, orch durably prepares the complete batch in DEVICE_DB.
+All affected APPL_DB hashes are replaced in one transaction; all DEVICE_DB
+application hashes are replaced in another; only then is the device command and
+its outbox marker appended atomically. On restart, orch claims pending config
+and result events before reading newer entries, reloads the prepared batch, and
+resumes the whole batch without filtering already staged members. A crash can
+therefore leave a prepared batch waiting, but cannot emit a partial hardware
+swap or duplicate the device command.
 
 The application state is `APPLYING` or `REMOVING` while the device command is
 outstanding. `ocs-orch` separately consumes `OCS_DEVICE_RESULTS`, moves a

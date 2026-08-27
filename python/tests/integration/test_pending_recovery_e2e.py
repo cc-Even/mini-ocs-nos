@@ -66,15 +66,6 @@ async def test_crashed_syncd_claims_pending_without_duplicate_side_effects(
     }
     for client in clients.values():
         await client.flushdb()
-    await clients[CONFIG_DB].hset(
-        device_config_key("ocs0"),
-        mapping={
-            "name": "ocs0",
-            "input_port_count": "16",
-            "output_port_count": "16",
-            "admin_status": "ENABLED",
-        },
-    )
 
     service = GnmiService(
         SetTransaction(RedisConfigRepository(settings)),
@@ -116,7 +107,11 @@ async def test_crashed_syncd_claims_pending_without_duplicate_side_effects(
             stderr=asyncio.subprocess.STDOUT,
         )
         processes.append(crashing_syncd)
-        await asyncio.sleep(0.1)
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while not await clients[CONFIG_DB].exists(device_config_key("ocs0")):
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("syncd did not initialize device inventory")
+            await asyncio.sleep(0.02)
 
         async with GnmiClient(f"127.0.0.1:{port}", timeout_seconds=5.0) as client:
             await client.set_connections("ocs0", [ConnectionSpec("conn-recovery", 6, 13)])

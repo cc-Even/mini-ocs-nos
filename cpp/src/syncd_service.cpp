@@ -68,31 +68,6 @@ ApplyResult decodeDurableResult(const std::string& payload) {
     return result;
 }
 
-bool desiredStateMatches(
-    const DeviceCommandBatch& batch,
-    const std::vector<AppliedConnection>& actual,
-    ApplyResult& recovered) {
-    recovered = {};
-    for (const auto& command : batch.commands) {
-        const auto existing = std::ranges::find_if(actual, [&command](const auto& connection) {
-            return connection.id == command.id;
-        });
-        if (command.operation == ConnectionOperation::kRemove) {
-            if (existing != actual.end()) {
-                return false;
-            }
-            continue;
-        }
-        if (existing == actual.end() || existing->input_port != command.input_port ||
-            existing->output_port != command.output_port ||
-            existing->applied_version < command.desired_version) {
-            return false;
-        }
-        recovered.connections.push_back(*existing);
-    }
-    return true;
-}
-
 std::string statePayload(const std::map<std::string, std::string>& fields) {
     return nlohmann::json(fields).dump();
 }
@@ -105,7 +80,8 @@ SyncdService::SyncdService(
     std::chrono::milliseconds pending_min_idle)
     : device_db_(endpoint, redis::LogicalDb::kDevice),
       state_db_(endpoint, redis::LogicalDb::kState),
-      counters_db_(std::move(endpoint), redis::LogicalDb::kCounters),
+      counters_db_(endpoint, redis::LogicalDb::kCounters),
+      config_db_(std::move(endpoint), redis::LogicalDb::kConfig),
       device_(std::move(device)),
       pending_min_idle_(pending_min_idle) {
     if (!device_) {
@@ -118,6 +94,26 @@ SyncdService::SyncdService(
 
 void SyncdService::initialize() {
     device_db_.createConsumerGroup(std::string(redis::kDeviceCommands), std::string(kConsumerGroup));
+    const auto info = device_->getDeviceInfo();
+    const std::map<std::string, std::string> inventory{
+        {"name", info.name},
+        {"input_port_count", std::to_string(info.input_port_count)},
+        {"output_port_count", std::to_string(info.output_port_count)},
+        {"admin_status", "ENABLED"},
+        {"model", info.model},
+        {"serial_number", info.serial_number},
+        {"firmware_version", info.firmware_version},
+    };
+    const auto key = redis::deviceConfigKey(info.name);
+    static_cast<void>(config_db_.putHashIfAbsent(key, inventory));
+    const auto configured = config_db_.getHash(key);
+    if (configured.find("name") == configured.end() || configured.at("name") != info.name ||
+        configured.find("input_port_count") == configured.end() ||
+        configured.at("input_port_count") != std::to_string(info.input_port_count) ||
+        configured.find("output_port_count") == configured.end() ||
+        configured.at("output_port_count") != std::to_string(info.output_port_count)) {
+        throw std::runtime_error("configured device inventory does not match backend identity");
+    }
 }
 
 bool SyncdService::processOne(
@@ -131,6 +127,10 @@ bool SyncdService::processOne(
         pending_min_idle_,
         1);
     if (messages.empty()) {
+        if (device_db_.pendingCount(
+                std::string(redis::kDeviceCommands), std::string(kConsumerGroup)) > 0) {
+            return false;
+        }
         messages = device_db_.readGroup(
             std::string(redis::kDeviceCommands), std::string(kConsumerGroup), consumer_name, 1);
     }
@@ -146,11 +146,7 @@ bool SyncdService::processOne(
     DeviceCommandBatch batch;
     try {
         batch = decodeDeviceCommand(message.event.payload);
-        if (isStaleVersion(message.event, batch)) {
-            markProcessed(message.event, batch, false);
-            acknowledge(message.id);
-            return true;
-        }
+        batch.options.operation_id = message.event.event_id;
     } catch (const std::exception& error) {
         ApplyResult malformed;
         malformed.error = {ErrorCode::kProtocolMalformed, error.what()};
@@ -163,14 +159,19 @@ bool SyncdService::processOne(
     auto stored_result = device_db_.getHash(result_key);
     if (stored_result.empty()) {
         const auto attempt_key = redis::deviceApplyAttemptKey(message.event.event_id);
-        const bool recovering_apply = !device_db_.getHash(attempt_key).empty();
-        device_db_.putHash(
+        const bool recovering_attempt = !device_db_.getHash(attempt_key).empty();
+        if (!recovering_attempt && isStaleVersion(message.event, batch)) {
+            markProcessed(message.event, batch, false);
+            acknowledge(message.id);
+            return true;
+        }
+        static_cast<void>(device_db_.putHashIfAbsent(
             attempt_key,
             {
                 {"command_id", message.event.event_id},
                 {"device", message.event.device},
                 {"started_at_ns", std::to_string(timestampNowNs())},
-            });
+            }));
         ApplyResult result;
         try {
             const auto device_info = device_->getDeviceInfo();
@@ -179,9 +180,7 @@ bool SyncdService::processOne(
                     ErrorCode::kDeviceNotReady,
                     "command device does not match the connected device backend",
                 };
-            } else if (
-                !recovering_apply ||
-                !desiredStateMatches(batch, device_->getConnections(), result)) {
+            } else {
                 result = device_->applyConnections(batch.commands, batch.options);
             }
         } catch (const std::exception& error) {
@@ -266,8 +265,16 @@ void SyncdService::markProcessed(
         }});
     if (applied) {
         for (const auto& command : batch.commands) {
+            const auto version_key =
+                redis::syncdConnectionVersionKey(command_event.device, command.id);
+            const auto existing = device_db_.getHash(version_key);
+            const auto last = existing.find("last_successful_version");
+            if (last != existing.end() &&
+                std::stoull(last->second) >= command.desired_version) {
+                continue;
+            }
             hashes.push_back({
-                redis::syncdConnectionVersionKey(command_event.device, command.id),
+                version_key,
                 {
                     {"last_successful_version", std::to_string(command.desired_version)},
                     {"last_command_id", command_event.event_id},
@@ -303,6 +310,21 @@ long long SyncdService::publishState(
         }
         const auto state_key = redis::connectionStateKey(command_event.device, command.id);
         const auto previous_state = state_db_.getHash(state_key);
+        const auto previous_desired = previous_state.find("desired_version");
+        if (previous_desired != previous_state.end() &&
+            std::stoull(previous_desired->second) > command.desired_version) {
+            static_cast<void>(state_db_.putHashIfAbsent(
+                publication_key,
+                {
+                    {"command_id", command_event.event_id},
+                    {"connection_id", command.id},
+                    {"active_delta", "0"},
+                    {"superseded", "true"},
+                }));
+            active_delta += std::stoll(
+                state_db_.getHash(publication_key).at("active_delta"));
+            continue;
+        }
         const auto actual_present = previous_state.find("actual_present");
         const auto applied_version = previous_state.find("applied_version");
         const bool was_active = actual_present != previous_state.end()
@@ -389,6 +411,30 @@ void SyncdService::publishResult(
     const redis::EventEnvelope& command_event,
     const DeviceCommandBatch& batch,
     const ApplyResult& result) {
+    if (batch.commands.empty()) {
+        const redis::EventEnvelope result_event{
+            .event_schema_version = 1,
+            .event_id = command_event.event_id + ":result",
+            .request_id = command_event.request_id,
+            .timestamp_ns = timestampNowNs(),
+            .device = command_event.device,
+            .resource_type = command_event.resource_type,
+            .resource_id = command_event.resource_id,
+            .operation = "APPLY_RESULT",
+            .desired_version = command_event.desired_version,
+            .payload = resultPayload(result),
+        };
+        static_cast<void>(device_db_.appendEventOnce(
+            redis::syncdResultPublicationKey(
+                command_event.event_id, command_event.resource_id),
+            {
+                {"command_id", command_event.event_id},
+                {"connection_id", command_event.resource_id},
+            },
+            std::string(redis::kDeviceResults),
+            result_event));
+        return;
+    }
     for (const auto& command : batch.commands) {
         redis::EventEnvelope result_event{
             .event_schema_version = 1,

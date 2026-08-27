@@ -76,15 +76,6 @@ async def test_scenarios_a_and_b_through_ocsctl_and_gnmi(tmp_path: Path) -> None
     cleanup_clients = [create_redis_client(settings, database) for database in (0, 1, 2, 4, 6, 8)]
     for client in cleanup_clients:
         await client.flushdb()
-    await cleanup_clients[3].hset(
-        device_config_key("ocs0"),
-        mapping={
-            "name": "ocs0",
-            "input_port_count": "16",
-            "output_port_count": "16",
-            "admin_status": "ENABLED",
-        },
-    )
 
     hwsim_socket = tmp_path / "ocs-hwsim.sock"
     executable_root = REPOSITORY_ROOT / "build" / "dev" / "cpp"
@@ -124,7 +115,11 @@ async def test_scenarios_a_and_b_through_ocsctl_and_gnmi(tmp_path: Path) -> None
                 stderr=asyncio.subprocess.STDOUT,
             )
         )
-        await asyncio.sleep(0.1)
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while not await cleanup_clients[3].exists(device_config_key("ocs0")):
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("syncd did not initialize device inventory")
+            await asyncio.sleep(0.02)
 
         code, stdout, stderr = await _run_cli(target, "capabilities")
         assert code == 0, stderr
@@ -158,6 +153,35 @@ async def test_scenarios_a_and_b_through_ocsctl_and_gnmi(tmp_path: Path) -> None
             counters = await client.get("/ocs/devices/device[name=ocs0]/counters")
             assert counters["active-connections"] == 3
 
+        code, _, stderr = await _run_cli(
+            target,
+            "connection",
+            "batch",
+            "ocs0",
+            "--connection",
+            "conn-1:1:10",
+            "--connection",
+            "conn-2:2:9",
+        )
+        assert code == 0, stderr
+        async with GnmiClient(target, timeout_seconds=5.0) as client:
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while True:
+                swapped = [
+                    await client.get(connection_path("ocs0", connection_id, "state"))
+                    for connection_id in ("conn-1", "conn-2")
+                ]
+                if all(
+                    state["apply-status"] == "ACTIVE"
+                    and state["desired-version"] == state["applied-version"] == 2
+                    for state in swapped
+                ):
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("atomic output swap did not reach version 2")
+                await asyncio.sleep(0.05)
+            assert [state["output-port"] for state in swapped] == [10, 9]
+
         code, stdout, stderr = await _run_cli(
             target,
             "get",
@@ -165,7 +189,7 @@ async def test_scenarios_a_and_b_through_ocsctl_and_gnmi(tmp_path: Path) -> None
         )
         assert code == 0, stderr
         cli_state = json.loads(stdout)
-        assert cli_state["desired-version"] == cli_state["applied-version"] == 1
+        assert cli_state["desired-version"] == cli_state["applied-version"] == 2
 
         watch_environment = os.environ.copy()
         watch_environment["PYTHONPATH"] = str(REPOSITORY_ROOT / "python")
@@ -202,7 +226,7 @@ async def test_scenarios_a_and_b_through_ocsctl_and_gnmi(tmp_path: Path) -> None
         watch_stdout, watch_stderr = await watch.communicate()
         assert watch.returncode == 0, watch_stderr.decode()
         assert '"sync-response": true' in watch_stdout.decode()
-        assert '"applied-version": 2' in watch_stdout.decode()
+        assert '"applied-version": 3' in watch_stdout.decode()
 
         code, _, stderr = await _run_cli(target, "connection", "delete", "ocs0", "conn-2")
         assert code == 0, stderr

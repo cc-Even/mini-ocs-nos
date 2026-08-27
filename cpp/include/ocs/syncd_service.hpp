@@ -47,6 +47,7 @@ private:
     redis::RedisRepository device_db_;
     redis::RedisRepository state_db_;
     redis::RedisRepository counters_db_;
+    redis::RedisRepository config_db_;
     std::unique_ptr<OcsDeviceApi> device_;
     std::chrono::milliseconds pending_min_idle_;
 };

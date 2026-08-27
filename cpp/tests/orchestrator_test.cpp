@@ -270,6 +270,140 @@ TEST_F(OrchestratorIntegrationTest, PreservesAtomicOutputSwapAsOneDeviceBatch) {
         "ACTIVE");
 }
 
+TEST_F(OrchestratorIntegrationTest, RecoversWholeAtomicBatchAfterApplicationPhaseCrash) {
+    const auto initial_event = [](std::string id, ocs::PortId input, ocs::PortId output) {
+        return ocs::redis::EventEnvelope{
+            .event_schema_version = 1,
+            .event_id = "event-crash-swap-initial-" + id,
+            .request_id = "request-crash-swap-initial-" + id,
+            .timestamp_ns = 1780000000000000040ULL,
+            .device = "ocs0",
+            .resource_type = "connection",
+            .resource_id = id,
+            .operation = "UPSERT",
+            .desired_version = 1,
+            .payload = "{\"input_port\":" + std::to_string(input) +
+                       ",\"output_port\":" + std::to_string(output) + "}",
+        };
+    };
+    applyConfigEvent(initial_event("crash-swap-a", 1, 9));
+    applyConfigEvent(initial_event("crash-swap-b", 2, 10));
+
+    const ocs::DeviceCommandBatch swap{
+        .commands = {
+            {
+                .id = "crash-swap-a",
+                .input_port = 1,
+                .output_port = 10,
+                .desired_version = 2,
+            },
+            {
+                .id = "crash-swap-b",
+                .input_port = 2,
+                .output_port = 9,
+                .desired_version = 2,
+            },
+        },
+        .options = {},
+    };
+    const ocs::redis::EventEnvelope batch_event{
+        .event_schema_version = 1,
+        .event_id = "event-crash-swap-batch-002",
+        .request_id = "request-crash-swap-batch-002",
+        .timestamp_ns = 1780000000000000042ULL,
+        .device = "ocs0",
+        .resource_type = "connection-batch",
+        .resource_id = "request-crash-swap-batch-002",
+        .operation = "APPLY_BATCH",
+        .desired_version = 2,
+        .payload = ocs::encodeDeviceCommand(swap),
+    };
+    static_cast<void>(config_db_->appendEvent(
+        std::string(ocs::redis::kConfigEvents), batch_event));
+
+    struct SimulatedCrash {};
+    EXPECT_THROW(
+        static_cast<void>(orch_->processConfigOne(
+            "orch-crash-swap",
+            [](std::string_view phase) {
+                if (phase == "application") {
+                    throw SimulatedCrash{};
+                }
+            })),
+        SimulatedCrash);
+    EXPECT_EQ(config_db_->pendingCount(std::string(ocs::redis::kConfigEvents), "ocs-orch"), 1);
+    EXPECT_FALSE(syncd_->processOne("syncd-before-orch-recovery"));
+    EXPECT_EQ(
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "crash-swap-a"))
+            .at("desired_version"),
+        "2");
+    EXPECT_EQ(
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "crash-swap-b"))
+            .at("desired_version"),
+        "2");
+
+    orch_.reset();
+    orch_ = std::make_unique<ocs::OrchestratorService>(endpoint_);
+    orch_->initialize();
+    ASSERT_TRUE(orch_->processConfigOne("orch-crash-swap-recovery"));
+    ASSERT_TRUE(syncd_->processOne("syncd-crash-swap-recovery"));
+    ASSERT_TRUE(orch_->processResultOne("orch-crash-swap-result"));
+    ASSERT_TRUE(orch_->processResultOne("orch-crash-swap-result"));
+
+    const auto state_a =
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "crash-swap-a"));
+    const auto state_b =
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "crash-swap-b"));
+    EXPECT_EQ(state_a.at("output_port"), "10");
+    EXPECT_EQ(state_b.at("output_port"), "9");
+    EXPECT_EQ(state_a.at("applied_version"), "2");
+    EXPECT_EQ(state_b.at("applied_version"), "2");
+    EXPECT_EQ(config_db_->pendingCount(std::string(ocs::redis::kConfigEvents), "ocs-orch"), 0);
+}
+
+TEST_F(OrchestratorIntegrationTest, MalformedDeviceCommandPublishesTerminalFailure) {
+    const std::map<std::string, std::string> application{
+        {"device", "ocs0"},
+        {"id", "malformed"},
+        {"input_port", "1"},
+        {"output_port", "9"},
+        {"desired_version", "1"},
+        {"apply_status", "APPLYING"},
+        {"operation", "UPSERT"},
+        {"request_id", "request-malformed"},
+        {"event_id", "event-malformed"},
+        {"command_id", "command-malformed"},
+        {"last_error_code", ""},
+        {"last_error_message", ""},
+    };
+    appl_db_->putHash(
+        ocs::redis::connectionAppKey("ocs0", "malformed"), application);
+    device_db_->putHash(
+        ocs::redis::connectionDeviceKey("ocs0", "malformed"), application);
+    const ocs::redis::EventEnvelope malformed{
+        .event_schema_version = 1,
+        .event_id = "command-malformed",
+        .request_id = "request-malformed",
+        .timestamp_ns = 1780000000000000045ULL,
+        .device = "ocs0",
+        .resource_type = "connection",
+        .resource_id = "malformed",
+        .operation = "UPSERT",
+        .desired_version = 1,
+        .payload = "{not-json",
+    };
+    static_cast<void>(device_db_->appendEvent(
+        std::string(ocs::redis::kDeviceCommands), malformed));
+
+    ASSERT_TRUE(syncd_->processOne("syncd-malformed"));
+    ASSERT_TRUE(orch_->processResultOne("orch-malformed-result"));
+
+    const auto failed =
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "malformed"));
+    EXPECT_EQ(failed.at("apply_status"), "FAILED");
+    EXPECT_EQ(failed.at("last_error_code"), "OCS_PROTOCOL_MALFORMED");
+}
+
 TEST_F(OrchestratorIntegrationTest, CoalescesConsecutiveVersionsWhileApplyIsOutstanding) {
     const ocs::redis::EventEnvelope first{
         .event_schema_version = 1,
@@ -370,11 +504,15 @@ TEST_F(OrchestratorIntegrationTest, LatestRemoveConvergesWhenOutstandingCreateFa
     ASSERT_TRUE(orch_->processConfigOne("orch-test-create-remove"));
     ASSERT_TRUE(orch_->processConfigOne("orch-test-create-remove"));
 
+    syncd_.reset();
     {
         ocs::UdsDeviceBackend fault_backend(hwsim_socket_);
         ASSERT_TRUE(
             fault_backend.injectFault({.type = ocs::FaultType::kNextApplyError}).error.ok());
     }
+    syncd_ = std::make_unique<ocs::SyncdService>(
+        endpoint_, std::make_unique<ocs::UdsDeviceBackend>(hwsim_socket_));
+    syncd_->initialize();
     ASSERT_TRUE(syncd_->processOne("syncd-test-create-remove"));
     ASSERT_TRUE(orch_->processResultOne("orch-test-create-remove-result"));
     ASSERT_TRUE(syncd_->processOne("syncd-test-create-remove"));

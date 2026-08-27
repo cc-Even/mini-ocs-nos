@@ -47,16 +47,40 @@ DeviceHealth SimulatedOcsDevice::getHealth() const {
 ApplyResult SimulatedOcsDevice::applyConnections(
     const std::vector<ConnectionCommand>& commands,
     const ApplyOptions& options) {
+    std::scoped_lock lock(mutex_);
+    if (!options.operation_id.empty()) {
+        if (const auto cached = apply_results_.find(options.operation_id);
+            cached != apply_results_.end()) {
+            return cached->second;
+        }
+    }
+    const auto finish = [this, &options](ApplyResult result) {
+        if (!options.operation_id.empty()) {
+            apply_results_.insert_or_assign(options.operation_id, result);
+        }
+        return result;
+    };
     if (!options.atomic) {
-        return {makeError(ErrorCode::kUnsupported, "non-atomic apply is not supported"), {}};
+        return finish({makeError(ErrorCode::kUnsupported, "non-atomic apply is not supported"), {}});
     }
 
-    std::scoped_lock lock(mutex_);
     auto candidate_connections = connections_;
 
     for (const auto& command : commands) {
+        if (command.desired_version == 0) {
+            continue;
+        }
+        const auto last = last_versions_.find(command.id);
+        if (last != last_versions_.end() && last->second > command.desired_version) {
+            return finish(
+                {makeError(ErrorCode::kVersionStale, "connection version is stale"), {}});
+        }
+    }
+
+    for (const auto& command : commands) {
         if (command.id.empty()) {
-            return {makeError(ErrorCode::kInvalidArgument, "connection id must not be empty"), {}};
+            return finish(
+                {makeError(ErrorCode::kInvalidArgument, "connection id must not be empty"), {}});
         }
 
         if (command.operation == ConnectionOperation::kRemove) {
@@ -69,11 +93,11 @@ ApplyResult SimulatedOcsDevice::applyConnections(
 
         if (const auto error = validatePortAvailable(PortDirection::kInput, command.input_port);
             !error.ok()) {
-            return {error, {}};
+            return finish({error, {}});
         }
         if (const auto error = validatePortAvailable(PortDirection::kOutput, command.output_port);
             !error.ok()) {
-            return {error, {}};
+            return finish({error, {}});
         }
 
         candidate_connections.insert_or_assign(
@@ -91,10 +115,12 @@ ApplyResult SimulatedOcsDevice::applyConnections(
     for (const auto& [id, connection] : candidate_connections) {
         static_cast<void>(id);
         if (candidate_input_to_output.at(connection.input_port - 1).has_value()) {
-            return {makeError(ErrorCode::kInputConflict, "input port is already connected"), {}};
+            return finish(
+                {makeError(ErrorCode::kInputConflict, "input port is already connected"), {}});
         }
         if (candidate_output_to_input.at(connection.output_port - 1).has_value()) {
-            return {makeError(ErrorCode::kOutputConflict, "output port is already connected"), {}};
+            return finish(
+                {makeError(ErrorCode::kOutputConflict, "output port is already connected"), {}});
         }
         candidate_input_to_output.at(connection.input_port - 1) = connection.output_port;
         candidate_output_to_input.at(connection.output_port - 1) = connection.input_port;
@@ -102,12 +128,17 @@ ApplyResult SimulatedOcsDevice::applyConnections(
 
     if (fail_next_apply_) {
         fail_next_apply_ = false;
-        return {makeError(ErrorCode::kApplyFailed, "injected next-apply failure"), {}};
+        return finish({makeError(ErrorCode::kApplyFailed, "injected next-apply failure"), {}});
     }
 
     connections_.swap(candidate_connections);
     input_to_output_.swap(candidate_input_to_output);
     output_to_input_.swap(candidate_output_to_input);
+    for (const auto& command : commands) {
+        if (command.desired_version != 0) {
+            last_versions_.insert_or_assign(command.id, command.desired_version);
+        }
+    }
 
     std::vector<AppliedConnection> changed;
     changed.reserve(commands.size());
@@ -116,7 +147,7 @@ ApplyResult SimulatedOcsDevice::applyConnections(
             changed.push_back(connection->second);
         }
     }
-    return {Error::success(), std::move(changed)};
+    return finish({Error::success(), std::move(changed)});
 }
 
 std::vector<AppliedConnection> SimulatedOcsDevice::getConnections() const {
@@ -141,11 +172,13 @@ PortState SimulatedOcsDevice::getPortState(PortDirection direction, PortId id) c
 ResetResult SimulatedOcsDevice::reset(ResetMode mode) {
     std::scoped_lock lock(mutex_);
     connections_.clear();
+    last_versions_.clear();
     std::ranges::fill(input_to_output_, std::nullopt);
     std::ranges::fill(output_to_input_, std::nullopt);
     input_ports_ = makePorts(PortDirection::kInput, info_.input_port_count);
     output_ports_ = makePorts(PortDirection::kOutput, info_.output_port_count);
     fail_next_apply_ = false;
+    apply_results_.clear();
     if (mode == ResetMode::kHard) {
         ++info_.generation;
     }

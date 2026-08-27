@@ -33,10 +33,12 @@ private:
     DeviceInfo info_;
     DeviceHealth health_{DeviceOperStatus::kReady, Error::success()};
     std::map<std::string, AppliedConnection> connections_;
+    std::map<std::string, std::uint64_t> last_versions_;
     std::vector<std::optional<PortId>> input_to_output_;
     std::vector<std::optional<PortId>> output_to_input_;
     std::vector<PortState> input_ports_;
     std::vector<PortState> output_ports_;
+    std::map<std::string, ApplyResult> apply_results_;
     bool fail_next_apply_{false};
 };
 

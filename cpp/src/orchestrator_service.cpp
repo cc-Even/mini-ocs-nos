@@ -182,44 +182,49 @@ std::string operationName(ConnectionOperation operation) {
 
 }  // namespace
 
-OrchestratorService::OrchestratorService(redis::RedisEndpoint endpoint)
+OrchestratorService::OrchestratorService(
+    redis::RedisEndpoint endpoint,
+    std::chrono::milliseconds pending_min_idle)
     : config_db_(endpoint, redis::LogicalDb::kConfig),
       appl_db_(endpoint, redis::LogicalDb::kAppl),
-      device_db_(std::move(endpoint), redis::LogicalDb::kDevice) {}
+      device_db_(std::move(endpoint), redis::LogicalDb::kDevice),
+      pending_min_idle_(pending_min_idle) {
+    if (pending_min_idle_.count() < 0 || pending_min_idle_ > std::chrono::hours(1)) {
+        throw std::invalid_argument("orch pending minimum idle time is outside 0..3600000ms");
+    }
+}
 
 void OrchestratorService::initialize() {
     config_db_.createConsumerGroup(std::string(redis::kConfigEvents), std::string(kConsumerGroup));
     device_db_.createConsumerGroup(std::string(redis::kDeviceResults), std::string(kConsumerGroup));
 }
 
-bool OrchestratorService::processConfigOne(const std::string& consumer_name) {
-    const auto messages = config_db_.readGroup(
-        std::string(redis::kConfigEvents), std::string(kConsumerGroup), consumer_name, 1);
+bool OrchestratorService::processConfigOne(
+    const std::string& consumer_name,
+    const std::function<void(std::string_view)>& after_phase) {
+    auto messages = config_db_.claimPending(
+        std::string(redis::kConfigEvents),
+        std::string(kConsumerGroup),
+        consumer_name,
+        pending_min_idle_,
+        1);
+    if (messages.empty()) {
+        if (config_db_.pendingCount(
+                std::string(redis::kConfigEvents), std::string(kConsumerGroup)) > 0) {
+            return false;
+        }
+        messages = config_db_.readGroup(
+            std::string(redis::kConfigEvents), std::string(kConsumerGroup), consumer_name, 1);
+    }
     if (messages.empty()) {
         return false;
     }
 
     const auto& message = messages.front();
-    auto batch = decodeConfigBatchEvent(message.event);
-    std::vector<ConnectionCommand> commands;
-    commands.reserve(batch.commands.size());
-    for (auto command : batch.commands) {
-        const auto app_key = redis::connectionAppKey(message.event.device, command.id);
-        const auto existing_application = appl_db_.getHash(app_key);
-        const auto previous_version = currentVersion(existing_application);
-        if (command.desired_version <= previous_version) {
-            continue;
-        }
-        if (command.operation == ConnectionOperation::kRemove && existing_application.empty()) {
-            continue;
-        }
-        if (message.event.resource_type == "connection" &&
-            command.desired_version - previous_version > 1) {
-            command = loadDesiredSnapshot(config_db_, message.event);
-        }
-        commands.push_back(std::move(command));
-    }
-    if (commands.empty()) {
+    const auto prepared_key = redis::orchConfigBatchKey(message.event.event_id);
+    const auto publication_key =
+        redis::orchDeviceCommandPublicationKey(message.event.event_id);
+    if (!device_db_.getHash(publication_key).empty()) {
         const auto acknowledged = config_db_.acknowledge(
             std::string(redis::kConfigEvents), std::string(kConsumerGroup), message.id);
         if (acknowledged != 1) {
@@ -228,8 +233,61 @@ bool OrchestratorService::processConfigOne(const std::string& consumer_name) {
         return true;
     }
 
+    auto prepared = device_db_.getHash(prepared_key);
+    DeviceCommandBatch batch;
+    if (!prepared.empty()) {
+        batch = decodeDeviceCommand(prepared.at("payload"));
+    } else {
+        batch = decodeConfigBatchEvent(message.event);
+        std::vector<ConnectionCommand> commands;
+        commands.reserve(batch.commands.size());
+        bool stale_batch = false;
+        for (auto command : batch.commands) {
+            const auto app_key = redis::connectionAppKey(message.event.device, command.id);
+            const auto existing_application = appl_db_.getHash(app_key);
+            const auto previous_version = currentVersion(existing_application);
+            if (command.desired_version <= previous_version) {
+                stale_batch = true;
+                break;
+            }
+            if (command.operation == ConnectionOperation::kRemove &&
+                existing_application.empty()) {
+                continue;
+            }
+            if (message.event.resource_type == "connection" &&
+                command.desired_version - previous_version > 1) {
+                command = loadDesiredSnapshot(config_db_, message.event);
+            }
+            commands.push_back(std::move(command));
+        }
+        if (stale_batch || commands.empty()) {
+            const auto acknowledged = config_db_.acknowledge(
+                std::string(redis::kConfigEvents), std::string(kConsumerGroup), message.id);
+            if (acknowledged != 1) {
+                throw std::runtime_error("orch failed to acknowledge stale configuration event");
+            }
+            return true;
+        }
+        batch.commands = std::move(commands);
+        static_cast<void>(device_db_.putHashIfAbsent(
+            prepared_key,
+            {
+                {"event_id", message.event.event_id},
+                {"request_id", message.event.request_id},
+                {"device", message.event.device},
+                {"payload", encodeDeviceCommand(batch)},
+            }));
+        prepared = device_db_.getHash(prepared_key);
+        batch = decodeDeviceCommand(prepared.at("payload"));
+    }
+    if (after_phase) {
+        after_phase("prepared");
+    }
+
     const auto command_id = message.event.event_id + ":command";
-    for (const auto& command : commands) {
+    std::vector<std::pair<std::string, std::map<std::string, std::string>>> applications;
+    std::vector<std::pair<std::string, std::map<std::string, std::string>>> device_states;
+    for (const auto& command : batch.commands) {
         const auto app_key = redis::connectionAppKey(message.event.device, command.id);
         const auto device_key = redis::connectionDeviceKey(message.event.device, command.id);
         const auto existing_application = appl_db_.getHash(app_key);
@@ -249,11 +307,17 @@ bool OrchestratorService::processConfigOne(const std::string& consumer_name) {
             {"last_error_code", ""},
             {"last_error_message", ""},
         };
-        appl_db_.putHash(app_key, application);
-        device_db_.putHash(device_key, application);
+        applications.push_back({app_key, application});
+        device_states.push_back({device_key, application});
     }
-
-    batch.commands = std::move(commands);
+    appl_db_.putHashesAtomically(applications);
+    if (after_phase) {
+        after_phase("application");
+    }
+    device_db_.putHashesAtomically(device_states);
+    if (after_phase) {
+        after_phase("device-state");
+    }
     const redis::EventEnvelope command_event{
         .event_schema_version = 1,
         .event_id = command_id,
@@ -269,8 +333,14 @@ bool OrchestratorService::processConfigOne(const std::string& consumer_name) {
         .desired_version = message.event.desired_version,
         .payload = encodeDeviceCommand(batch),
     };
-    static_cast<void>(
-        device_db_.appendEvent(std::string(redis::kDeviceCommands), command_event));
+    static_cast<void>(device_db_.appendEventOnce(
+        publication_key,
+        {{"event_id", message.event.event_id}, {"command_id", command_id}},
+        std::string(redis::kDeviceCommands),
+        command_event));
+    if (after_phase) {
+        after_phase("command");
+    }
 
     const auto acknowledged = config_db_.acknowledge(
         std::string(redis::kConfigEvents), std::string(kConsumerGroup), message.id);
@@ -281,8 +351,20 @@ bool OrchestratorService::processConfigOne(const std::string& consumer_name) {
 }
 
 bool OrchestratorService::processResultOne(const std::string& consumer_name) {
-    const auto messages = device_db_.readGroup(
-        std::string(redis::kDeviceResults), std::string(kConsumerGroup), consumer_name, 1);
+    auto messages = device_db_.claimPending(
+        std::string(redis::kDeviceResults),
+        std::string(kConsumerGroup),
+        consumer_name,
+        pending_min_idle_,
+        1);
+    if (messages.empty()) {
+        if (device_db_.pendingCount(
+                std::string(redis::kDeviceResults), std::string(kConsumerGroup)) > 0) {
+            return false;
+        }
+        messages = device_db_.readGroup(
+            std::string(redis::kDeviceResults), std::string(kConsumerGroup), consumer_name, 1);
+    }
     if (messages.empty()) {
         return false;
     }

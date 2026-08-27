@@ -57,6 +57,7 @@ struct PortState {
 struct ApplyOptions {
     bool atomic{true};
     std::chrono::milliseconds timeout{1000};
+    std::string operation_id;
 };
 
 struct ApplyResult {
