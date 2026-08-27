@@ -13,9 +13,12 @@
 
 #include <chrono>
 #include <csignal>
+#include <condition_variable>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -343,7 +346,7 @@ TEST_F(OrchestratorIntegrationTest, RecoversWholeAtomicBatchAfterApplicationPhas
         "2");
 
     orch_.reset();
-    orch_ = std::make_unique<ocs::OrchestratorService>(endpoint_);
+    orch_ = std::make_unique<ocs::OrchestratorService>(endpoint_, std::chrono::milliseconds(0));
     orch_->initialize();
     ASSERT_TRUE(orch_->processConfigOne("orch-crash-swap-recovery"));
     ASSERT_TRUE(syncd_->processOne("syncd-crash-swap-recovery"));
@@ -402,6 +405,310 @@ TEST_F(OrchestratorIntegrationTest, MalformedDeviceCommandPublishesTerminalFailu
         appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "malformed"));
     EXPECT_EQ(failed.at("apply_status"), "FAILED");
     EXPECT_EQ(failed.at("last_error_code"), "OCS_PROTOCOL_MALFORMED");
+}
+
+TEST_F(OrchestratorIntegrationTest, MalformedBatchFailsEveryPreparedMember) {
+    const ocs::DeviceCommandBatch batch{
+        .commands = {
+            {.id = "malformed-a", .input_port = 1, .output_port = 9, .desired_version = 1},
+            {.id = "malformed-b", .input_port = 2, .output_port = 10, .desired_version = 1},
+        },
+        .options = {},
+    };
+    for (const auto& command : batch.commands) {
+        const std::map<std::string, std::string> application{
+            {"device", "ocs0"},
+            {"id", command.id},
+            {"input_port", std::to_string(command.input_port)},
+            {"output_port", std::to_string(command.output_port)},
+            {"desired_version", "1"},
+            {"apply_status", "APPLYING"},
+            {"operation", "UPSERT"},
+            {"request_id", "request-malformed-batch"},
+            {"event_id", "event-malformed-batch"},
+            {"command_id", "event-malformed-batch:command"},
+            {"last_error_code", ""},
+            {"last_error_message", ""},
+        };
+        appl_db_->putHash(ocs::redis::connectionAppKey("ocs0", command.id), application);
+        device_db_->putHash(ocs::redis::connectionDeviceKey("ocs0", command.id), application);
+    }
+    device_db_->putHash(
+        ocs::redis::orchConfigBatchKey("event-malformed-batch"),
+        {{"payload", ocs::encodeDeviceCommand(batch)}});
+    const ocs::redis::EventEnvelope malformed{
+        .event_schema_version = 1,
+        .event_id = "event-malformed-batch:command",
+        .request_id = "request-malformed-batch",
+        .timestamp_ns = 1780000000000000046ULL,
+        .device = "ocs0",
+        .resource_type = "connection-batch",
+        .resource_id = "request-malformed-batch",
+        .operation = "APPLY_BATCH",
+        .desired_version = 1,
+        .payload = "{not-json",
+    };
+    static_cast<void>(device_db_->appendEvent(
+        std::string(ocs::redis::kDeviceCommands), malformed));
+
+    ASSERT_TRUE(syncd_->processOne("syncd-malformed-batch"));
+    ASSERT_TRUE(orch_->processResultOne("orch-malformed-batch-result"));
+    ASSERT_TRUE(orch_->processResultOne("orch-malformed-batch-result"));
+
+    for (const auto& command : batch.commands) {
+        const auto failed =
+            appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", command.id));
+        EXPECT_EQ(failed.at("apply_status"), "FAILED");
+        EXPECT_EQ(failed.at("last_error_code"), "OCS_PROTOCOL_MALFORMED");
+    }
+}
+
+TEST_F(OrchestratorIntegrationTest, OrphanMalformedBatchResultIsAcknowledged) {
+    const ocs::redis::EventEnvelope malformed{
+        .event_schema_version = 1,
+        .event_id = "external-malformed-batch",
+        .request_id = "request-external-malformed-batch",
+        .timestamp_ns = 1780000000000000047ULL,
+        .device = "ocs0",
+        .resource_type = "connection-batch",
+        .resource_id = "request-external-malformed-batch",
+        .operation = "APPLY_BATCH",
+        .desired_version = 1,
+        .payload = "{not-json",
+    };
+    static_cast<void>(device_db_->appendEvent(
+        std::string(ocs::redis::kDeviceCommands), malformed));
+
+    ASSERT_TRUE(syncd_->processOne("syncd-orphan-malformed-batch"));
+    bool processed = false;
+    EXPECT_NO_THROW(processed = orch_->processResultOne("orch-orphan-malformed-batch-result"));
+    EXPECT_TRUE(processed);
+    EXPECT_EQ(device_db_->pendingCount(std::string(ocs::redis::kDeviceResults), "ocs-orch"), 0);
+}
+
+TEST_F(OrchestratorIntegrationTest, ConcurrentClaimCannotRegressCompletedApplication) {
+    const ocs::redis::EventEnvelope event{
+        .event_schema_version = 1,
+        .event_id = "event-concurrent-claim",
+        .request_id = "request-concurrent-claim",
+        .timestamp_ns = 1780000000000000048ULL,
+        .device = "ocs0",
+        .resource_type = "connection",
+        .resource_id = "concurrent-claim",
+        .operation = "UPSERT",
+        .desired_version = 1,
+        .payload = R"({"input_port":3,"output_port":11})",
+    };
+    static_cast<void>(config_db_->appendEvent(std::string(ocs::redis::kConfigEvents), event));
+
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool prepared = false;
+    bool resume = false;
+    std::exception_ptr first_error;
+    std::thread first([&] {
+        try {
+            static_cast<void>(orch_->processConfigOne(
+                "orch-concurrent-first",
+                [&](std::string_view phase) {
+                    if (phase != "prepared") {
+                        return;
+                    }
+                    std::unique_lock lock(mutex);
+                    prepared = true;
+                    condition.notify_all();
+                    condition.wait(lock, [&] { return resume; });
+                }));
+        } catch (...) {
+            first_error = std::current_exception();
+        }
+    });
+    bool first_reached_prepared = false;
+    {
+        std::unique_lock lock(mutex);
+        first_reached_prepared = condition.wait_for(
+            lock, std::chrono::seconds(2), [&] { return prepared; });
+    }
+
+    ocs::OrchestratorService second(endpoint_, std::chrono::milliseconds(0));
+    second.initialize();
+    const bool second_configured =
+        first_reached_prepared && second.processConfigOne("orch-concurrent-second");
+    const bool device_processed = second_configured && syncd_->processOne("syncd-concurrent");
+    const bool result_processed =
+        device_processed && second.processResultOne("orch-concurrent-result");
+    {
+        std::lock_guard lock(mutex);
+        resume = true;
+    }
+    condition.notify_all();
+    first.join();
+
+    EXPECT_TRUE(first_reached_prepared);
+    EXPECT_TRUE(second_configured);
+    EXPECT_TRUE(device_processed);
+    EXPECT_TRUE(result_processed);
+    EXPECT_EQ(first_error, nullptr);
+    const auto application =
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "concurrent-claim"));
+    EXPECT_EQ(application.at("apply_status"), "ACTIVE");
+    EXPECT_EQ(
+        counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"))
+            .at("device_apply_total"),
+        "1");
+}
+
+TEST_F(OrchestratorIntegrationTest, NewerEventCannotOvertakePendingAtomicBatch) {
+    const ocs::DeviceCommandBatch first_batch{
+        .commands = {
+            {.id = "ordered-a", .input_port = 1, .output_port = 9, .desired_version = 1},
+            {.id = "ordered-b", .input_port = 2, .output_port = 10, .desired_version = 1},
+        },
+        .options = {},
+    };
+    const ocs::redis::EventEnvelope first_event{
+        .event_schema_version = 1,
+        .event_id = "event-ordered-batch-1",
+        .request_id = "request-ordered-batch-1",
+        .timestamp_ns = 1780000000000000050ULL,
+        .device = "ocs0",
+        .resource_type = "connection-batch",
+        .resource_id = "request-ordered-batch-1",
+        .operation = "APPLY_BATCH",
+        .desired_version = 1,
+        .payload = ocs::encodeDeviceCommand(first_batch),
+    };
+    const ocs::redis::EventEnvelope second_event{
+        .event_schema_version = 1,
+        .event_id = "event-ordered-a-2",
+        .request_id = "request-ordered-a-2",
+        .timestamp_ns = 1780000000000000051ULL,
+        .device = "ocs0",
+        .resource_type = "connection",
+        .resource_id = "ordered-a",
+        .operation = "UPSERT",
+        .desired_version = 2,
+        .payload = R"({"input_port":3,"output_port":11})",
+    };
+    static_cast<void>(config_db_->appendEvent(
+        std::string(ocs::redis::kConfigEvents), first_event));
+    static_cast<void>(config_db_->appendEvent(
+        std::string(ocs::redis::kConfigEvents), second_event));
+
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool prepared = false;
+    bool resume = false;
+    bool first_processed = false;
+    std::exception_ptr first_error;
+    std::thread first([&] {
+        try {
+            first_processed = orch_->processConfigOne(
+                "orch-ordered-first",
+                [&](std::string_view phase) {
+                    if (phase != "prepared") {
+                        return;
+                    }
+                    std::unique_lock lock(mutex);
+                    prepared = true;
+                    condition.notify_all();
+                    condition.wait(lock, [&] { return resume; });
+                });
+        } catch (...) {
+            first_error = std::current_exception();
+        }
+    });
+    bool first_reached_prepared = false;
+    {
+        std::unique_lock lock(mutex);
+        first_reached_prepared = condition.wait_for(
+            lock, std::chrono::seconds(2), [&] { return prepared; });
+    }
+
+    ocs::OrchestratorService second(endpoint_, std::chrono::hours(1));
+    second.initialize();
+    bool newer_overtook = false;
+    std::exception_ptr second_error;
+    try {
+        newer_overtook =
+            first_reached_prepared && second.processConfigOne("orch-ordered-second");
+    } catch (...) {
+        second_error = std::current_exception();
+    }
+    {
+        std::lock_guard lock(mutex);
+        resume = true;
+    }
+    condition.notify_all();
+    first.join();
+
+    EXPECT_TRUE(first_reached_prepared);
+    EXPECT_FALSE(newer_overtook);
+    EXPECT_TRUE(first_processed);
+    EXPECT_EQ(first_error, nullptr);
+    EXPECT_EQ(second_error, nullptr);
+    ASSERT_TRUE(syncd_->processOne("syncd-ordered-first"));
+    ASSERT_TRUE(orch_->processResultOne("orch-ordered-first-result"));
+    ASSERT_TRUE(orch_->processResultOne("orch-ordered-first-result"));
+
+    ASSERT_TRUE(second.processConfigOne("orch-ordered-second"));
+    ASSERT_TRUE(syncd_->processOne("syncd-ordered-second"));
+    ASSERT_TRUE(second.processResultOne("orch-ordered-second-result"));
+    const auto ordered_a =
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "ordered-a"));
+    const auto ordered_b =
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "ordered-b"));
+    EXPECT_EQ(ordered_a.at("desired_version"), "2");
+    EXPECT_EQ(ordered_a.at("apply_status"), "ACTIVE");
+    EXPECT_EQ(ordered_b.at("desired_version"), "1");
+    EXPECT_EQ(ordered_b.at("apply_status"), "ACTIVE");
+}
+
+TEST_F(OrchestratorIntegrationTest, RecoversResultAfterDeviceDatabasePhaseCrash) {
+    const ocs::redis::EventEnvelope event{
+        .event_schema_version = 1,
+        .event_id = "event-result-crash",
+        .request_id = "request-result-crash",
+        .timestamp_ns = 1780000000000000049ULL,
+        .device = "ocs0",
+        .resource_type = "connection",
+        .resource_id = "result-crash",
+        .operation = "UPSERT",
+        .desired_version = 1,
+        .payload = R"({"input_port":4,"output_port":12})",
+    };
+    static_cast<void>(config_db_->appendEvent(std::string(ocs::redis::kConfigEvents), event));
+    ASSERT_TRUE(orch_->processConfigOne("orch-result-crash-config"));
+    ASSERT_TRUE(syncd_->processOne("syncd-result-crash"));
+
+    struct SimulatedCrash {};
+    EXPECT_THROW(
+        static_cast<void>(orch_->processResultOne(
+            "orch-result-crash-first",
+            [](std::string_view phase) {
+                if (phase == "device-result") {
+                    throw SimulatedCrash{};
+                }
+            })),
+        SimulatedCrash);
+    EXPECT_EQ(
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "result-crash"))
+            .at("apply_status"),
+        "APPLYING");
+    EXPECT_EQ(
+        device_db_->getHash(ocs::redis::connectionDeviceKey("ocs0", "result-crash"))
+            .at("apply_status"),
+        "ACTIVE");
+    EXPECT_EQ(device_db_->pendingCount(std::string(ocs::redis::kDeviceResults), "ocs-orch"), 1);
+
+    orch_ = std::make_unique<ocs::OrchestratorService>(endpoint_, std::chrono::milliseconds(0));
+    orch_->initialize();
+    ASSERT_TRUE(orch_->processResultOne("orch-result-crash-recovery"));
+    EXPECT_EQ(
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "result-crash"))
+            .at("apply_status"),
+        "ACTIVE");
+    EXPECT_EQ(device_db_->pendingCount(std::string(ocs::redis::kDeviceResults), "ocs-orch"), 0);
 }
 
 TEST_F(OrchestratorIntegrationTest, CoalescesConsecutiveVersionsWhileApplyIsOutstanding) {

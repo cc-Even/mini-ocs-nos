@@ -83,6 +83,10 @@ public:
         const std::map<std::string, std::string>& marker_fields,
         const std::string& key,
         const std::map<std::string, long long>& increments);
+    [[nodiscard]] bool putVersionedHashesAtomicallyIfMarkerAbsent(
+        const std::string& marker_key,
+        const std::map<std::string, std::string>& marker_fields,
+        const std::vector<std::pair<std::string, std::map<std::string, std::string>>>& hashes);
     void putHashesAtomically(
         const std::vector<std::pair<std::string, std::map<std::string, std::string>>>& hashes);
 
@@ -92,6 +96,11 @@ public:
         const std::string& group,
         const std::string& start_id = "0-0");
     [[nodiscard]] std::vector<StreamMessage> readGroup(
+        const std::string& stream,
+        const std::string& group,
+        const std::string& consumer,
+        std::size_t count = 1);
+    [[nodiscard]] std::vector<StreamMessage> readGroupIfNoPending(
         const std::string& stream,
         const std::string& group,
         const std::string& consumer,

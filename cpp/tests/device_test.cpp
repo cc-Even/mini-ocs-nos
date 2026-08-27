@@ -203,6 +203,30 @@ TEST(InProcessSimBackendTest, RejectsUncachedOlderVersionWithoutRollingBackMatri
     EXPECT_EQ(actual.front().applied_version, 2);
 }
 
+TEST(InProcessSimBackendTest, BoundsOperationResultReplayRetention) {
+    auto backend = makeBackend();
+    ASSERT_TRUE(
+        backend->applyConnections({}, ocs::ApplyOptions{.operation_id = "evicted-operation"})
+            .ok());
+    for (int index = 0; index < 4096; ++index) {
+        ASSERT_TRUE(
+            backend
+                ->applyConnections(
+                    {},
+                    ocs::ApplyOptions{
+                        .operation_id = "retained-operation-" + std::to_string(index)})
+                .ok());
+    }
+    ASSERT_TRUE(backend->injectFault({.type = ocs::FaultType::kNextApplyError}).error.ok());
+
+    const auto replay = backend->applyConnections(
+        {{.id = "after-eviction", .input_port = 1, .output_port = 9, .desired_version = 1}},
+        ocs::ApplyOptions{.operation_id = "evicted-operation"});
+
+    EXPECT_EQ(replay.error.code, ocs::ErrorCode::kApplyFailed);
+    EXPECT_TRUE(backend->getConnections().empty());
+}
+
 TEST(InProcessSimBackendTest, RejectsDownAndDisabledPorts) {
     auto device = std::make_shared<ocs::SimulatedOcsDevice>(defaultDeviceInfo());
     ocs::InProcessSimBackend backend(device);

@@ -63,6 +63,26 @@ TEST_F(RedisContractTest, ReplacesHashWithoutRetainingOldFields) {
     EXPECT_EQ(config_->getHash(key), replacement);
 }
 
+TEST_F(RedisContractTest, VersionedOncePublicationCannotOverwriteNewerHash) {
+    const auto key = ocs::redis::connectionConfigKey("ocs0", "conn-version-fence");
+    const auto marker = "OCS_TEST_VERSIONED_MARKER";
+    const std::map<std::string, std::string> newer{
+        {"desired_version", "2"}, {"apply_status", "ACTIVE"}};
+    config_->putHash(key, newer);
+
+    EXPECT_TRUE(config_->putVersionedHashesAtomicallyIfMarkerAbsent(
+        marker,
+        {{"event_id", "older-event"}, {"desired_version", "1"}},
+        {{key, {{"desired_version", "1"}, {"apply_status", "APPLYING"}}}}));
+
+    EXPECT_EQ(config_->getHash(key), newer);
+    EXPECT_EQ(config_->getHash(marker).at("desired_version"), "1");
+    EXPECT_FALSE(config_->putVersionedHashesAtomicallyIfMarkerAbsent(
+        marker,
+        {{"event_id", "older-event"}, {"desired_version", "1"}},
+        {{key, {{"desired_version", "1"}, {"apply_status", "APPLYING"}}}}));
+}
+
 TEST_F(RedisContractTest, NeverExposesIntermediateMissingHashDuringReplacement) {
     const auto key = ocs::redis::connectionConfigKey("ocs0", "conn-atomic-replace");
     config_->putHash(key, {{"desired_version", "0"}, {"marker", "initial"}});
@@ -153,6 +173,59 @@ TEST_F(RedisContractTest, ClaimsAnIdlePendingEntryForAnotherConsumer) {
     EXPECT_EQ(config_->pendingCount(stream, "claim-test"), 1);
     EXPECT_EQ(config_->acknowledge(stream, "claim-test", message_id), 1);
     EXPECT_EQ(config_->pendingCount(stream, "claim-test"), 0);
+}
+
+TEST_F(RedisContractTest, SerializesNewGroupReadsBeforeCreatingAnotherPendingEntry) {
+    const std::string stream(ocs::redis::kConfigEvents);
+    const std::string group = "serialized-read-test";
+    config_->createConsumerGroup(stream, group);
+    const ocs::redis::EventEnvelope first_event{
+        .event_schema_version = 1,
+        .event_id = "serialized-event-1",
+        .request_id = "serialized-request-1",
+        .timestamp_ns = 1780000000000000010ULL,
+        .device = "ocs0",
+        .resource_type = "connection",
+        .resource_id = "serialized-1",
+        .operation = "UPSERT",
+        .desired_version = 1,
+        .payload = R"({"input_port":1,"output_port":9})",
+    };
+    auto second_event = first_event;
+    second_event.event_id = "serialized-event-2";
+    second_event.request_id = "serialized-request-2";
+    second_event.resource_id = "serialized-2";
+    second_event.timestamp_ns += 1;
+    static_cast<void>(config_->appendEvent(stream, first_event));
+    static_cast<void>(config_->appendEvent(stream, second_event));
+
+    ocs::redis::RedisRepository reader_a(endpoint_, ocs::redis::LogicalDb::kConfig);
+    ocs::redis::RedisRepository reader_b(endpoint_, ocs::redis::LogicalDb::kConfig);
+    std::barrier start(3);
+    std::vector<ocs::redis::StreamMessage> messages_a;
+    std::vector<ocs::redis::StreamMessage> messages_b;
+    std::jthread thread_a([&] {
+        start.arrive_and_wait();
+        messages_a = reader_a.readGroupIfNoPending(stream, group, "serialized-a");
+    });
+    std::jthread thread_b([&] {
+        start.arrive_and_wait();
+        messages_b = reader_b.readGroupIfNoPending(stream, group, "serialized-b");
+    });
+    start.arrive_and_wait();
+    thread_a.join();
+    thread_b.join();
+
+    ASSERT_EQ(messages_a.size() + messages_b.size(), 1);
+    EXPECT_EQ(config_->pendingCount(stream, group), 1);
+    const auto& first_message = messages_a.empty() ? messages_b.front() : messages_a.front();
+    EXPECT_EQ(first_message.event.event_id, "serialized-event-1");
+    EXPECT_EQ(config_->acknowledge(stream, group, first_message.id), 1);
+
+    const auto remaining =
+        config_->readGroupIfNoPending(stream, group, "serialized-after-ack");
+    ASSERT_EQ(remaining.size(), 1);
+    EXPECT_EQ(remaining.front().event.event_id, "serialized-event-2");
 }
 
 TEST_F(RedisContractTest, RejectsUnsupportedEventSchemaBeforeAppend) {

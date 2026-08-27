@@ -68,6 +68,23 @@ ApplyResult decodeDurableResult(const std::string& payload) {
     return result;
 }
 
+DeviceCommandBatch recoverPreparedBatch(
+    redis::RedisRepository& device_db,
+    const redis::EventEnvelope& command_event) {
+    constexpr std::string_view suffix = ":command";
+    if (!command_event.event_id.ends_with(suffix)) {
+        return {};
+    }
+    const auto config_event_id = command_event.event_id.substr(
+        0, command_event.event_id.size() - suffix.size());
+    const auto prepared = device_db.getHash(redis::orchConfigBatchKey(config_event_id));
+    const auto payload = prepared.find("payload");
+    if (payload == prepared.end()) {
+        return {};
+    }
+    return decodeDeviceCommand(payload->second);
+}
+
 std::string statePayload(const std::map<std::string, std::string>& fields) {
     return nlohmann::json(fields).dump();
 }
@@ -127,12 +144,8 @@ bool SyncdService::processOne(
         pending_min_idle_,
         1);
     if (messages.empty()) {
-        if (device_db_.pendingCount(
-                std::string(redis::kDeviceCommands), std::string(kConsumerGroup)) > 0) {
-            return false;
-        }
-        messages = device_db_.readGroup(
-            std::string(redis::kDeviceCommands), std::string(kConsumerGroup), consumer_name, 1);
+        messages = device_db_.readGroupIfNoPending(
+            std::string(redis::kDeviceCommands), std::string(kConsumerGroup), consumer_name);
     }
     if (messages.empty()) {
         return false;
@@ -150,6 +163,11 @@ bool SyncdService::processOne(
     } catch (const std::exception& error) {
         ApplyResult malformed;
         malformed.error = {ErrorCode::kProtocolMalformed, error.what()};
+        try {
+            batch = recoverPreparedBatch(device_db_, message.event);
+        } catch (const std::exception&) {
+            batch = {};
+        }
         device_db_.putHash(
             redis::deviceApplyResultKey(message.event.event_id),
             {{"payload", durableResultPayload(malformed)}});

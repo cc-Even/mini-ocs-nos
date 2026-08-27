@@ -20,8 +20,12 @@ successfully applied resource version and
 Per-phase `OCS_DEVICE_APPLY_*` and `OCS_SYNCD_*_PUBLISHED` hashes make recovery
 of device execution, state, counters, and result publication independently
 idempotent.
-`OCS_ORCH_CONFIG_BATCH|event-id` preserves a prepared orchestration batch, and
-`OCS_ORCH_DEVICE_COMMAND_PUBLISHED|event-id` is its atomic outbox marker.
+`OCS_ORCH_CONFIG_BATCH|event-id` preserves a prepared orchestration batch.
+`OCS_ORCH_APPLICATION_PUBLISHED|event-id`,
+`OCS_ORCH_DEVICE_STATE_PUBLISHED|event-id`, and
+`OCS_ORCH_DEVICE_COMMAND_PUBLISHED|event-id` fence its APPL_DB, DEVICE_DB, and
+atomic outbox phases respectively. Result phases use corresponding
+`OCS_ORCH_RESULT_*_PUBLISHED|result-event-id` markers.
 
 Every stream message uses this v1 envelope:
 
@@ -131,6 +135,10 @@ returns the first result for a repeated operation ID, including an original
 failure, and rejects an uncached resource version older than its last successful
 version. A response-lost retry therefore cannot repeat a hardware transition,
 turn a one-shot failure into success, or roll a newer matrix backward.
+The simulator retains at most 4096 operation results. In the supported
+single-active-syncd topology, pending-command draining prevents a live
+unacknowledged operation from being displaced by later commands, while bounding
+long-running simulator memory use.
 
 Successful UPSERT commands replace `OCS_CONNECTION_STATE|device|id` in
 STATE_DB with the confirmed ports, desired/applied versions, and `ACTIVE`
@@ -171,9 +179,12 @@ same operation ID and receives the original cached result. State publication,
 counter increments, and each result event use their own atomic once marker. A
 superseded phase cannot overwrite a newer state or version. The
 processed-command marker and all advancing per-resource version markers are
-written in one DEVICE_DB transaction. Malformed commands still produce an
-envelope-level failure result before ACK. Therefore recovery can resume after
-any persistence boundary without losing or duplicating those effects.
+written in one DEVICE_DB transaction. If a published command payload is
+malformed, syncd reloads the durable prepared orch batch and emits a terminal
+failure for every member; an external command without a prepared batch receives
+an envelope-level fallback result, which orch acknowledges as an orphan if no
+application resource exists. Therefore recovery can resume after any persistence
+boundary without losing or duplicating those effects.
 
 Each syncd loop first performs a bounded XPENDING scan and XCLAIM for commands
 whose idle time exceeds `OCS_SYNCD_PENDING_MIN_IDLE_MS` (five seconds by
@@ -185,10 +196,13 @@ or result events, or increment counters. Scenario E launches a process with the
 deterministic crash hook at that exact boundary and verifies all four side-effect
 counts remain one after recovery.
 While any pending command exists but is not old enough to claim, syncd does not
-read newer stream entries. This preserves command order and prevents a newer
-version from overtaking unfinished state or counter phases. Redis optimistic
-once operations retry WATCH conflicts at most eight times and retain the
-repository socket deadline.
+read newer stream entries. One nonblocking Redis script atomically checks the
+group's pending count and reads the next entry, so two consumers cannot
+simultaneously turn successive new entries into pending work. This prevents a
+newer version from overtaking unfinished state or counter phases; device and
+Redis version fences add rollback protection for duplicate recovery consumers.
+Redis optimistic once operations retry WATCH conflicts at most eight times and
+retain the repository socket deadline.
 
 ## Orchestration contract
 
@@ -202,13 +216,21 @@ one atomic batch to `OCS_DEVICE_COMMANDS` in DEVICE_DB. The command event ID is
 derived from the configuration event ID so the relationship remains traceable.
 
 Before changing APPL_DB, orch durably prepares the complete batch in DEVICE_DB.
-All affected APPL_DB hashes are replaced in one transaction; all DEVICE_DB
-application hashes are replaced in another; only then is the device command and
-its outbox marker appended atomically. On restart, orch claims pending config
-and result events before reading newer entries, reloads the prepared batch, and
-resumes the whole batch without filtering already staged members. A crash can
+All affected APPL_DB hashes and their phase marker are replaced in one
+conditional transaction; all DEVICE_DB application hashes and their phase
+marker are replaced in another; only then is the device command and its outbox
+marker appended atomically. Competing consumers can resume a claimed event, but
+only one wins each phase marker, so a late consumer cannot regress an already
+terminal application to `APPLYING`. Each phase transaction also watches the
+target hashes and skips a target whose desired version is newer, fencing races
+between different events. On restart, orch claims pending config and
+result events before reading newer entries, reloads the prepared batch, and
+resumes the whole batch without filtering already staged members. Production
+claims require five seconds of idle time; tests can lower that bounded setting.
+The same atomic pending-check/read script prevents a second consumer from taking
+the next configuration event while the prior one is pending. A crash can
 therefore leave a prepared batch waiting, but cannot emit a partial hardware
-swap or duplicate the device command.
+swap, let a later batch overtake it, or duplicate the device command.
 
 The application state is `APPLYING` or `REMOVING` while the device command is
 outstanding. `ocs-orch` separately consumes `OCS_DEVICE_RESULTS`, moves a
@@ -216,6 +238,10 @@ successful apply to `ACTIVE`, records a successful delete as an `ABSENT`
 tombstone, and records failures as `FAILED`. Configuration and result events
 are acknowledged only after their corresponding snapshots and downstream
 events have been published.
+Result handling conditionally persists the DEVICE_DB terminal snapshot or
+deletion first and the APPL_DB terminal snapshot second, with one per-event
+marker in each database. Recovery completes whichever phase is missing before
+ACK, while duplicate consumers cannot repeat either mutation.
 
 APPL_DB's `desired_version` is the orchestrator's durable per-resource version.
 Events at or below that version are stale and are acknowledged without emitting

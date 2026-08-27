@@ -8,6 +8,8 @@
 namespace ocs {
 namespace {
 
+inline constexpr std::size_t kMaxCachedApplyResults = 4096;
+
 Error makeError(ErrorCode code, std::string message) {
     return Error{code, std::move(message)};
 }
@@ -56,7 +58,12 @@ ApplyResult SimulatedOcsDevice::applyConnections(
     }
     const auto finish = [this, &options](ApplyResult result) {
         if (!options.operation_id.empty()) {
+            if (apply_results_.size() >= kMaxCachedApplyResults) {
+                apply_results_.erase(apply_result_order_.front());
+                apply_result_order_.pop_front();
+            }
             apply_results_.insert_or_assign(options.operation_id, result);
+            apply_result_order_.push_back(options.operation_id);
         }
         return result;
     };
@@ -179,6 +186,7 @@ ResetResult SimulatedOcsDevice::reset(ResetMode mode) {
     output_ports_ = makePorts(PortDirection::kOutput, info_.output_port_count);
     fail_next_apply_ = false;
     apply_results_.clear();
+    apply_result_order_.clear();
     if (mode == ResetMode::kHard) {
         ++info_.generation;
     }

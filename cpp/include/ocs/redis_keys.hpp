@@ -66,8 +66,26 @@ inline constexpr std::string_view kFaultCommands = "OCS_FAULT_COMMANDS";
     return "OCS_ORCH_CONFIG_BATCH|" + std::string(event_id);
 }
 
+[[nodiscard]] inline std::string orchApplicationPublicationKey(std::string_view event_id) {
+    return "OCS_ORCH_APPLICATION_PUBLISHED|" + std::string(event_id);
+}
+
+[[nodiscard]] inline std::string orchDeviceStatePublicationKey(std::string_view event_id) {
+    return "OCS_ORCH_DEVICE_STATE_PUBLISHED|" + std::string(event_id);
+}
+
 [[nodiscard]] inline std::string orchDeviceCommandPublicationKey(std::string_view event_id) {
     return "OCS_ORCH_DEVICE_COMMAND_PUBLISHED|" + std::string(event_id);
+}
+
+[[nodiscard]] inline std::string orchResultApplicationPublicationKey(
+    std::string_view result_event_id) {
+    return "OCS_ORCH_RESULT_APPLICATION_PUBLISHED|" + std::string(result_event_id);
+}
+
+[[nodiscard]] inline std::string orchResultDevicePublicationKey(
+    std::string_view result_event_id) {
+    return "OCS_ORCH_RESULT_DEVICE_PUBLISHED|" + std::string(result_event_id);
 }
 
 [[nodiscard]] inline std::string deviceApplyAttemptKey(std::string_view command_id) {

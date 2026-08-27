@@ -13,13 +13,15 @@ class OrchestratorService {
 public:
     explicit OrchestratorService(
         redis::RedisEndpoint endpoint,
-        std::chrono::milliseconds pending_min_idle = std::chrono::milliseconds(0));
+        std::chrono::milliseconds pending_min_idle = std::chrono::seconds(5));
 
     void initialize();
     [[nodiscard]] bool processConfigOne(
         const std::string& consumer_name,
         const std::function<void(std::string_view)>& after_phase = {});
-    [[nodiscard]] bool processResultOne(const std::string& consumer_name);
+    [[nodiscard]] bool processResultOne(
+        const std::string& consumer_name,
+        const std::function<void(std::string_view)>& after_phase = {});
 
 private:
     redis::RedisRepository config_db_;

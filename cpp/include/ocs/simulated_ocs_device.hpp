@@ -2,6 +2,7 @@
 
 #include "ocs/device_types.hpp"
 
+#include <deque>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -39,6 +40,7 @@ private:
     std::vector<PortState> input_ports_;
     std::vector<PortState> output_ports_;
     std::map<std::string, ApplyResult> apply_results_;
+    std::deque<std::string> apply_result_order_;
     bool fail_next_apply_{false};
 };
 

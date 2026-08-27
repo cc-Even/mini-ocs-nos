@@ -209,12 +209,8 @@ bool OrchestratorService::processConfigOne(
         pending_min_idle_,
         1);
     if (messages.empty()) {
-        if (config_db_.pendingCount(
-                std::string(redis::kConfigEvents), std::string(kConsumerGroup)) > 0) {
-            return false;
-        }
-        messages = config_db_.readGroup(
-            std::string(redis::kConfigEvents), std::string(kConsumerGroup), consumer_name, 1);
+        messages = config_db_.readGroupIfNoPending(
+            std::string(redis::kConfigEvents), std::string(kConsumerGroup), consumer_name);
     }
     if (messages.empty()) {
         return false;
@@ -222,14 +218,16 @@ bool OrchestratorService::processConfigOne(
 
     const auto& message = messages.front();
     const auto prepared_key = redis::orchConfigBatchKey(message.event.event_id);
+    const auto application_publication_key =
+        redis::orchApplicationPublicationKey(message.event.event_id);
+    const auto device_state_publication_key =
+        redis::orchDeviceStatePublicationKey(message.event.event_id);
     const auto publication_key =
         redis::orchDeviceCommandPublicationKey(message.event.event_id);
     if (!device_db_.getHash(publication_key).empty()) {
         const auto acknowledged = config_db_.acknowledge(
             std::string(redis::kConfigEvents), std::string(kConsumerGroup), message.id);
-        if (acknowledged != 1) {
-            throw std::runtime_error("orch failed to acknowledge stale configuration event");
-        }
+        static_cast<void>(acknowledged);
         return true;
     }
 
@@ -263,9 +261,7 @@ bool OrchestratorService::processConfigOne(
         if (stale_batch || commands.empty()) {
             const auto acknowledged = config_db_.acknowledge(
                 std::string(redis::kConfigEvents), std::string(kConsumerGroup), message.id);
-            if (acknowledged != 1) {
-                throw std::runtime_error("orch failed to acknowledge stale configuration event");
-            }
+            static_cast<void>(acknowledged);
             return true;
         }
         batch.commands = std::move(commands);
@@ -310,11 +306,25 @@ bool OrchestratorService::processConfigOne(
         applications.push_back({app_key, application});
         device_states.push_back({device_key, application});
     }
-    appl_db_.putHashesAtomically(applications);
+    static_cast<void>(appl_db_.putVersionedHashesAtomicallyIfMarkerAbsent(
+        application_publication_key,
+        {
+            {"event_id", message.event.event_id},
+            {"command_id", command_id},
+            {"desired_version", std::to_string(message.event.desired_version)},
+        },
+        applications));
     if (after_phase) {
         after_phase("application");
     }
-    device_db_.putHashesAtomically(device_states);
+    static_cast<void>(device_db_.putVersionedHashesAtomicallyIfMarkerAbsent(
+        device_state_publication_key,
+        {
+            {"event_id", message.event.event_id},
+            {"command_id", command_id},
+            {"desired_version", std::to_string(message.event.desired_version)},
+        },
+        device_states));
     if (after_phase) {
         after_phase("device-state");
     }
@@ -344,13 +354,13 @@ bool OrchestratorService::processConfigOne(
 
     const auto acknowledged = config_db_.acknowledge(
         std::string(redis::kConfigEvents), std::string(kConsumerGroup), message.id);
-    if (acknowledged != 1) {
-        throw std::runtime_error("orch failed to acknowledge processed configuration event");
-    }
+    static_cast<void>(acknowledged);
     return true;
 }
 
-bool OrchestratorService::processResultOne(const std::string& consumer_name) {
+bool OrchestratorService::processResultOne(
+    const std::string& consumer_name,
+    const std::function<void(std::string_view)>& after_phase) {
     auto messages = device_db_.claimPending(
         std::string(redis::kDeviceResults),
         std::string(kConsumerGroup),
@@ -358,12 +368,8 @@ bool OrchestratorService::processResultOne(const std::string& consumer_name) {
         pending_min_idle_,
         1);
     if (messages.empty()) {
-        if (device_db_.pendingCount(
-                std::string(redis::kDeviceResults), std::string(kConsumerGroup)) > 0) {
-            return false;
-        }
-        messages = device_db_.readGroup(
-            std::string(redis::kDeviceResults), std::string(kConsumerGroup), consumer_name, 1);
+        messages = device_db_.readGroupIfNoPending(
+            std::string(redis::kDeviceResults), std::string(kConsumerGroup), consumer_name);
     }
     if (messages.empty()) {
         return false;
@@ -375,9 +381,21 @@ bool OrchestratorService::processResultOne(const std::string& consumer_name) {
     const auto app_key = redis::connectionAppKey(message.event.device, message.event.resource_id);
     const auto device_key =
         redis::connectionDeviceKey(message.event.device, message.event.resource_id);
+    const auto application_publication_key =
+        redis::orchResultApplicationPublicationKey(message.event.event_id);
+    const auto device_publication_key =
+        redis::orchResultDevicePublicationKey(message.event.event_id);
+    if (!appl_db_.getHash(application_publication_key).empty() &&
+        !device_db_.getHash(device_publication_key).empty()) {
+        static_cast<void>(device_db_.acknowledge(
+            std::string(redis::kDeviceResults), std::string(kConsumerGroup), message.id));
+        return true;
+    }
     auto application = appl_db_.getHash(app_key);
     if (application.empty()) {
-        throw std::runtime_error("device result has no matching application state");
+        static_cast<void>(device_db_.acknowledge(
+            std::string(redis::kDeviceResults), std::string(kConsumerGroup), message.id));
+        return true;
     }
 
     const auto application_version = currentVersion(application);
@@ -388,9 +406,7 @@ bool OrchestratorService::processResultOne(const std::string& consumer_name) {
          currentStatus(application) == ConnectionApplyStatus::kFailed)) {
         const auto acknowledged = device_db_.acknowledge(
             std::string(redis::kDeviceResults), std::string(kConsumerGroup), message.id);
-        if (acknowledged != 1) {
-            throw std::runtime_error("orch failed to acknowledge stale device result");
-        }
+        static_cast<void>(acknowledged);
         return true;
     }
     if (message.event.desired_version > application_version) {
@@ -405,25 +421,41 @@ bool OrchestratorService::processResultOne(const std::string& consumer_name) {
     }
     requireTransition(current, next);
 
-    if (next == ConnectionApplyStatus::kAbsent) {
-        application["apply_status"] = std::string(toString(next));
-        application["last_error_code"] = "";
-        application["last_error_message"] = "";
-        appl_db_.putHash(app_key, application);
-        static_cast<void>(device_db_.deleteKey(device_key));
-    } else {
-        application["apply_status"] = std::string(toString(next));
-        application["last_error_code"] = result.at("error_code").get<std::string>();
-        application["last_error_message"] = result.at("error_message").get<std::string>();
-        appl_db_.putHash(app_key, application);
-        device_db_.putHash(device_key, application);
+    application["apply_status"] = std::string(toString(next));
+    application["last_error_code"] =
+        next == ConnectionApplyStatus::kAbsent
+            ? ""
+            : result.at("error_code").get<std::string>();
+    application["last_error_message"] =
+        next == ConnectionApplyStatus::kAbsent
+            ? ""
+            : result.at("error_message").get<std::string>();
+    static_cast<void>(device_db_.putVersionedHashesAtomicallyIfMarkerAbsent(
+        device_publication_key,
+        {
+            {"result_event_id", message.event.event_id},
+            {"desired_version", std::to_string(message.event.desired_version)},
+        },
+        {{device_key, next == ConnectionApplyStatus::kAbsent
+                          ? std::map<std::string, std::string>{}
+                          : application}}));
+    if (after_phase) {
+        after_phase("device-result");
+    }
+    static_cast<void>(appl_db_.putVersionedHashesAtomicallyIfMarkerAbsent(
+        application_publication_key,
+        {
+            {"result_event_id", message.event.event_id},
+            {"desired_version", std::to_string(message.event.desired_version)},
+        },
+        {{app_key, application}}));
+    if (after_phase) {
+        after_phase("application-result");
     }
 
     const auto acknowledged = device_db_.acknowledge(
         std::string(redis::kDeviceResults), std::string(kConsumerGroup), message.id);
-    if (acknowledged != 1) {
-        throw std::runtime_error("orch failed to acknowledge processed device result");
-    }
+    static_cast<void>(acknowledged);
     return true;
 }
 

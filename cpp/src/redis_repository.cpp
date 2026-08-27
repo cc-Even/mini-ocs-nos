@@ -1,7 +1,6 @@
 #include "ocs/redis_repository.hpp"
 
 #include <sw/redis++/redis++.h>
-
 #include <iterator>
 #include <stdexcept>
 #include <tuple>
@@ -15,6 +14,19 @@ using FieldMap = std::unordered_map<std::string, std::string>;
 using StreamItem = std::pair<std::string, FieldMap>;
 using StreamResult = std::unordered_map<std::string, std::vector<StreamItem>>;
 inline constexpr int kMaxWatchRetries = 8;
+inline constexpr std::string_view kReadGroupIfNoPendingScript = R"(
+local pending = redis.call('XPENDING', KEYS[1], ARGV[1])
+if pending[1] ~= 0 then
+    return {}
+end
+local messages = redis.call(
+    'XREADGROUP', 'GROUP', ARGV[1], ARGV[2], 'COUNT', ARGV[3],
+    'STREAMS', KEYS[1], '>')
+if not messages then
+    return {}
+end
+return messages
+)";
 
 std::vector<std::pair<std::string, std::string>> eventFields(const EventEnvelope& event) {
     return {
@@ -254,6 +266,62 @@ bool RedisRepository::incrementHashFieldsOnce(
     throw std::runtime_error("Redis counter publication exceeded retry limit");
 }
 
+bool RedisRepository::putVersionedHashesAtomicallyIfMarkerAbsent(
+    const std::string& marker_key,
+    const std::map<std::string, std::string>& marker_fields,
+    const std::vector<std::pair<std::string, std::map<std::string, std::string>>>& hashes) {
+    const auto marker_version = marker_fields.find("desired_version");
+    if (marker_version == marker_fields.end()) {
+        throw std::invalid_argument("versioned Redis hash marker is missing desired_version");
+    }
+    const auto desired_version = std::stoull(marker_version->second);
+    for (int attempt = 0; attempt < kMaxWatchRetries; ++attempt) {
+        auto transaction = impl_->redis.transaction();
+        auto watched = transaction.redis();
+        watched.watch(marker_key);
+        for (const auto& [key, fields] : hashes) {
+            static_cast<void>(fields);
+            watched.watch(key);
+        }
+        if (watched.exists(marker_key) != 0) {
+            watched.unwatch();
+            return false;
+        }
+        std::vector<bool> publish;
+        publish.reserve(hashes.size());
+        for (const auto& [key, fields] : hashes) {
+            const auto fields_version = fields.find("desired_version");
+            if (fields_version != fields.end() &&
+                std::stoull(fields_version->second) != desired_version) {
+                watched.unwatch();
+                throw std::invalid_argument(
+                    "versioned Redis hash does not match marker desired_version");
+            }
+            const auto existing_version = watched.hget(key, "desired_version");
+            publish.push_back(
+                !existing_version || std::stoull(*existing_version) <= desired_version);
+        }
+        for (std::size_t index = 0; index < hashes.size(); ++index) {
+            if (!publish[index]) {
+                continue;
+            }
+            const auto& [key, fields] = hashes[index];
+            transaction.del(key);
+            if (!fields.empty()) {
+                transaction.hmset(key, fields.begin(), fields.end());
+            }
+        }
+        transaction.hmset(marker_key, marker_fields.begin(), marker_fields.end());
+        try {
+            static_cast<void>(transaction.exec());
+            return true;
+        } catch (const sw::redis::WatchError&) {
+            continue;
+        }
+    }
+    throw std::runtime_error("Redis versioned hash publication exceeded retry limit");
+}
+
 void RedisRepository::putHashesAtomically(
     const std::vector<std::pair<std::string, std::map<std::string, std::string>>>& hashes) {
     auto transaction = impl_->redis.transaction();
@@ -299,6 +367,30 @@ std::vector<StreamMessage> RedisRepository::readGroup(
         static_cast<long long>(count),
         std::inserter(raw, raw.end()));
 
+    std::vector<StreamMessage> result;
+    const auto messages = raw.find(stream);
+    if (messages == raw.end()) {
+        return result;
+    }
+    result.reserve(messages->second.size());
+    for (const auto& [id, fields] : messages->second) {
+        result.push_back({id, parseEvent(fields)});
+    }
+    return result;
+}
+
+std::vector<StreamMessage> RedisRepository::readGroupIfNoPending(
+    const std::string& stream,
+    const std::string& group,
+    const std::string& consumer,
+    std::size_t count) {
+    if (count == 0) {
+        throw std::invalid_argument("serialized stream read count must be positive");
+    }
+    const auto raw = impl_->redis.eval<StreamResult>(
+        std::string(kReadGroupIfNoPendingScript),
+        {stream},
+        {group, consumer, std::to_string(count)});
     std::vector<StreamMessage> result;
     const auto messages = raw.find(stream);
     if (messages == raw.end()) {
