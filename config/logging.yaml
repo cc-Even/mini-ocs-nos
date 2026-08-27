@@ -1,0 +1,20 @@
+format: json
+level: INFO
+required_fields:
+  - timestamp
+  - severity
+  - service
+  - request_id
+  - event_id
+  - command_id
+  - device
+  - resource_id
+  - desired_version
+  - operation
+  - duration_ms
+  - result
+  - error_code
+redacted_fields:
+  - password
+  - token
+  - private_key

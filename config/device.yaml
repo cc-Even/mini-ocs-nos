@@ -1,0 +1,14 @@
+device:
+  name: ocs0
+  input_port_count: 16
+  output_port_count: 16
+  model: SIM-16X16
+  serial_number: SIM-0001
+  firmware_version: sim-1.0.0
+  switching_delay_ms: 50
+  random_seed: 1
+
+transport:
+  socket_path: /run/mini-ocs/ocs-hwsim.sock
+  request_timeout_ms: 1000
+  max_payload_bytes: 1048576

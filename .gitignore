@@ -1,0 +1,28 @@
+# CMake and C++ build outputs
+/build/
+/out/
+compile_commands.json
+
+# Python environments and caches
+/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Local tooling and editor state
+/.cache/
+/.idea/
+/.vscode/
+*.swp
+
+# Local project guidance
+/*NTS.md
+/*-development-spec.md
+/docs/development-plan.md
+/docs/iteration-state.md
+
+# Runtime state
+*.log
+*.sock

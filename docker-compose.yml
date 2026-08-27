@@ -1,0 +1,26 @@
+name: mini-ocs-nos
+
+services:
+  redis:
+    image: redis:7.4.5-bookworm@sha256:90e7a336d044f1abc9e9dbc05d65566850896d11453bbd1dd0fb7e5059f0e8fb
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    restart: unless-stopped
+    networks:
+      - control-plane
+    volumes:
+      - redis-data:/data
+      - ./config/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - ${OCS_REDIS_RUNTIME_DIR:-/tmp/mini-ocs-redis-runtime}:/run/mini-ocs
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 1s
+      retries: 15
+      start_period: 2s
+
+networks:
+  control-plane:
+    internal: true
+
+volumes:
+  redis-data:
