@@ -185,6 +185,59 @@ std::vector<StreamMessage> RedisRepository::readGroup(
     return result;
 }
 
+std::vector<StreamMessage> RedisRepository::claimPending(
+    const std::string& stream,
+    const std::string& group,
+    const std::string& consumer,
+    std::chrono::milliseconds min_idle_time,
+    std::size_t count) {
+    if (count == 0 || min_idle_time.count() < 0) {
+        throw std::invalid_argument("pending claim count must be positive and idle non-negative");
+    }
+    using PendingEntry = std::tuple<std::string, std::string, long long, long long>;
+    std::vector<PendingEntry> pending;
+    const auto scan_count = static_cast<long long>(std::min<std::size_t>(100, count * 10));
+    impl_->redis.xpending(
+        stream,
+        group,
+        "-",
+        "+",
+        scan_count,
+        std::back_inserter(pending));
+
+    std::vector<std::string> ids;
+    ids.reserve(count);
+    for (const auto& [id, owner, idle_ms, deliveries] : pending) {
+        static_cast<void>(owner);
+        static_cast<void>(deliveries);
+        if (idle_ms >= min_idle_time.count()) {
+            ids.push_back(id);
+            if (ids.size() == count) {
+                break;
+            }
+        }
+    }
+    if (ids.empty()) {
+        return {};
+    }
+
+    std::vector<StreamItem> claimed;
+    impl_->redis.xclaim(
+        stream,
+        group,
+        consumer,
+        min_idle_time,
+        ids.begin(),
+        ids.end(),
+        std::back_inserter(claimed));
+    std::vector<StreamMessage> result;
+    result.reserve(claimed.size());
+    for (const auto& [id, fields] : claimed) {
+        result.push_back({id, parseEvent(fields)});
+    }
+    return result;
+}
+
 long long RedisRepository::acknowledge(
     const std::string& stream,
     const std::string& group,

@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <barrier>
+#include <chrono>
 #include <cstdlib>
 #include <map>
 #include <string>
@@ -123,6 +124,35 @@ TEST_F(RedisContractTest, ConsumerGroupCreationIsIdempotent) {
 
     EXPECT_NO_THROW(config_->createConsumerGroup(stream, "ocs-orch-test"));
     EXPECT_NO_THROW(config_->createConsumerGroup(stream, "ocs-orch-test"));
+}
+
+TEST_F(RedisContractTest, ClaimsAnIdlePendingEntryForAnotherConsumer) {
+    const ocs::redis::EventEnvelope expected{
+        .event_schema_version = 1,
+        .event_id = "event-claim-001",
+        .request_id = "request-claim-001",
+        .timestamp_ns = 1780000000000000001ULL,
+        .device = "ocs0",
+        .resource_type = "connection",
+        .resource_id = "conn-claim",
+        .operation = "UPSERT",
+        .desired_version = 1,
+        .payload = R"({"input_port":1,"output_port":9})",
+    };
+    const std::string stream(ocs::redis::kConfigEvents);
+    config_->createConsumerGroup(stream, "claim-test");
+    const auto message_id = config_->appendEvent(stream, expected);
+    ASSERT_EQ(config_->readGroup(stream, "claim-test", "failed-consumer").size(), 1);
+
+    const auto claimed = config_->claimPending(
+        stream, "claim-test", "recovery-consumer", std::chrono::milliseconds(0));
+
+    ASSERT_EQ(claimed.size(), 1);
+    EXPECT_EQ(claimed.front().id, message_id);
+    EXPECT_EQ(claimed.front().event, expected);
+    EXPECT_EQ(config_->pendingCount(stream, "claim-test"), 1);
+    EXPECT_EQ(config_->acknowledge(stream, "claim-test", message_id), 1);
+    EXPECT_EQ(config_->pendingCount(stream, "claim-test"), 0);
 }
 
 TEST_F(RedisContractTest, RejectsUnsupportedEventSchemaBeforeAppend) {

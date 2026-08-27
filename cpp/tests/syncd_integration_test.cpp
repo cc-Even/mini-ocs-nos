@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
@@ -195,6 +196,90 @@ TEST_F(SyncdIntegrationTest, FailedUpdatePreservesLastConfirmedActualConnection)
     ASSERT_EQ(actual.size(), 1);
     EXPECT_EQ(actual.front().input_port, 1);
     EXPECT_EQ(actual.front().output_port, 9);
+    EXPECT_EQ(actual.front().applied_version, 1);
+}
+
+TEST_F(SyncdIntegrationTest, ClaimsProcessedCommandAfterCrashWithoutRepeatingSideEffects) {
+    const std::string result_group = "crash-result-test";
+    const std::string state_group = "crash-state-test";
+    device_db_->createConsumerGroup(std::string(ocs::redis::kDeviceResults), result_group);
+    state_db_->createConsumerGroup(std::string(ocs::redis::kStateEvents), state_group);
+    syncd_.reset();
+    syncd_ = std::make_unique<ocs::SyncdService>(
+        endpoint_,
+        std::make_unique<ocs::UdsDeviceBackend>(hwsim_socket_),
+        std::chrono::milliseconds(0));
+    syncd_->initialize();
+
+    const ocs::DeviceCommandBatch command_batch{
+        .commands = {{
+            .id = "conn-crash",
+            .input_port = 4,
+            .output_port = 12,
+            .desired_version = 1,
+        }},
+        .options = {},
+    };
+    const ocs::redis::EventEnvelope command_event{
+        .event_schema_version = 1,
+        .event_id = "command-crash-001",
+        .request_id = "request-crash-001",
+        .timestamp_ns = 1780000000000000100ULL,
+        .device = "ocs0",
+        .resource_type = "connection",
+        .resource_id = "conn-crash",
+        .operation = "UPSERT",
+        .desired_version = 1,
+        .payload = ocs::encodeDeviceCommand(command_batch),
+    };
+    static_cast<void>(device_db_->appendEvent(
+        std::string(ocs::redis::kDeviceCommands), command_event));
+
+    struct SimulatedCrash {};
+    EXPECT_THROW(
+        static_cast<void>(syncd_->processOne("crashing-consumer", [] {
+            throw SimulatedCrash{};
+        })),
+        SimulatedCrash);
+    EXPECT_EQ(device_db_->pendingCount(std::string(ocs::redis::kDeviceCommands), "ocs-syncd"), 1);
+    EXPECT_FALSE(
+        device_db_->getHash(ocs::redis::processedDeviceCommandKey("command-crash-001")).empty());
+
+    const auto state_events = state_db_->readGroup(
+        std::string(ocs::redis::kStateEvents), state_group, "state-before-recovery");
+    const auto results = device_db_->readGroup(
+        std::string(ocs::redis::kDeviceResults), result_group, "result-before-recovery");
+    ASSERT_EQ(state_events.size(), 1);
+    ASSERT_EQ(results.size(), 1);
+    EXPECT_EQ(counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0")).at(
+                  "device_apply_total"),
+              "1");
+
+    syncd_.reset();
+    syncd_ = std::make_unique<ocs::SyncdService>(
+        endpoint_,
+        std::make_unique<ocs::UdsDeviceBackend>(hwsim_socket_),
+        std::chrono::milliseconds(0));
+    syncd_->initialize();
+    ASSERT_TRUE(syncd_->processOne("recovery-consumer"));
+
+    EXPECT_EQ(device_db_->pendingCount(std::string(ocs::redis::kDeviceCommands), "ocs-syncd"), 0);
+    EXPECT_TRUE(state_db_->readGroup(
+                             std::string(ocs::redis::kStateEvents),
+                             state_group,
+                             "state-after-recovery")
+                    .empty());
+    EXPECT_TRUE(device_db_->readGroup(
+                              std::string(ocs::redis::kDeviceResults),
+                              result_group,
+                              "result-after-recovery")
+                    .empty());
+    const auto counters = counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"));
+    EXPECT_EQ(counters.at("device_apply_total"), "1");
+    EXPECT_EQ(counters.at("active_connections"), "1");
+    const auto actual = simulated_device_->getConnections();
+    ASSERT_EQ(actual.size(), 1);
+    EXPECT_EQ(actual.front().id, "conn-crash");
     EXPECT_EQ(actual.front().applied_version, 1);
 }
 

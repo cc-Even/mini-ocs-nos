@@ -136,8 +136,17 @@ successful resource version. An already processed command ID, or a command no
 newer than the recorded successful version, is acknowledged without touching
 the device or incrementing apply counters. A completed attempt records its
 command ID before ACK; a successful device apply also advances the resource
-version. These records survive an ordinary syncd restart. Pending-entry claim
-after a crash during processing is intentionally deferred to Iteration 40.
+version. These records survive an ordinary syncd restart.
+
+Each syncd loop first performs a bounded XPENDING scan and XCLAIM for commands
+whose idle time exceeds `OCS_SYNCD_PENDING_MIN_IDLE_MS` (five seconds by
+default), then reads a new command. The claim threshold is configurable for
+tests but bounded to one hour. If syncd exits after its durable completion
+marker but before ACK, a restarted consumer claims the entry, observes the
+marker, and only acknowledges it. It does not reapply hardware, republish state
+or result events, or increment counters. Scenario E launches a process with the
+deterministic crash hook at that exact boundary and verifies all four side-effect
+counts remain one after recovery.
 
 ## Orchestration contract
 

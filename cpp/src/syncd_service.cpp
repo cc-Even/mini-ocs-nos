@@ -38,13 +38,20 @@ std::string statePayload(const std::map<std::string, std::string>& fields) {
 
 }  // namespace
 
-SyncdService::SyncdService(redis::RedisEndpoint endpoint, std::unique_ptr<OcsDeviceApi> device)
+SyncdService::SyncdService(
+    redis::RedisEndpoint endpoint,
+    std::unique_ptr<OcsDeviceApi> device,
+    std::chrono::milliseconds pending_min_idle)
     : device_db_(endpoint, redis::LogicalDb::kDevice),
       state_db_(endpoint, redis::LogicalDb::kState),
       counters_db_(std::move(endpoint), redis::LogicalDb::kCounters),
-      device_(std::move(device)) {
+      device_(std::move(device)),
+      pending_min_idle_(pending_min_idle) {
     if (!device_) {
         throw std::invalid_argument("syncd device backend must not be null");
+    }
+    if (pending_min_idle_.count() < 0) {
+        throw std::invalid_argument("syncd pending minimum idle time must not be negative");
     }
 }
 
@@ -52,9 +59,19 @@ void SyncdService::initialize() {
     device_db_.createConsumerGroup(std::string(redis::kDeviceCommands), std::string(kConsumerGroup));
 }
 
-bool SyncdService::processOne(const std::string& consumer_name) {
-    const auto messages = device_db_.readGroup(
-        std::string(redis::kDeviceCommands), std::string(kConsumerGroup), consumer_name, 1);
+bool SyncdService::processOne(
+    const std::string& consumer_name,
+    const std::function<void()>& before_ack) {
+    auto messages = device_db_.claimPending(
+        std::string(redis::kDeviceCommands),
+        std::string(kConsumerGroup),
+        consumer_name,
+        pending_min_idle_,
+        1);
+    if (messages.empty()) {
+        messages = device_db_.readGroup(
+            std::string(redis::kDeviceCommands), std::string(kConsumerGroup), consumer_name, 1);
+    }
     if (messages.empty()) {
         return false;
     }
@@ -87,6 +104,9 @@ bool SyncdService::processOne(const std::string& consumer_name) {
         result.ok() ? "device_apply_success_total" : "device_apply_failure_total"));
     publishResult(message.event, result);
     markProcessed(message.event, result.ok());
+    if (before_ack) {
+        before_ack();
+    }
     acknowledge(message.id);
     return true;
 }

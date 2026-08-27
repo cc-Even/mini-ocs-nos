@@ -73,6 +73,12 @@ public:
         const std::string& group,
         const std::string& consumer,
         std::size_t count = 1);
+    [[nodiscard]] std::vector<StreamMessage> claimPending(
+        const std::string& stream,
+        const std::string& group,
+        const std::string& consumer,
+        std::chrono::milliseconds min_idle_time,
+        std::size_t count = 1);
     [[nodiscard]] long long acknowledge(
         const std::string& stream,
         const std::string& group,

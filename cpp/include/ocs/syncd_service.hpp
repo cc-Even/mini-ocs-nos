@@ -4,6 +4,8 @@
 #include "ocs/device_api.hpp"
 #include "ocs/redis_repository.hpp"
 
+#include <chrono>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -11,10 +13,15 @@ namespace ocs {
 
 class SyncdService {
 public:
-    SyncdService(redis::RedisEndpoint endpoint, std::unique_ptr<OcsDeviceApi> device);
+    SyncdService(
+        redis::RedisEndpoint endpoint,
+        std::unique_ptr<OcsDeviceApi> device,
+        std::chrono::milliseconds pending_min_idle = std::chrono::seconds(5));
 
     void initialize();
-    [[nodiscard]] bool processOne(const std::string& consumer_name);
+    [[nodiscard]] bool processOne(
+        const std::string& consumer_name,
+        const std::function<void()>& before_ack = {});
 
 private:
     [[nodiscard]] bool isAlreadyProcessed(const redis::EventEnvelope& command_event);
@@ -31,6 +38,7 @@ private:
     redis::RedisRepository state_db_;
     redis::RedisRepository counters_db_;
     std::unique_ptr<OcsDeviceApi> device_;
+    std::chrono::milliseconds pending_min_idle_;
 };
 
 }  // namespace ocs
