@@ -62,6 +62,28 @@ class RedisSettings:
         )
 
 
+def create_redis_client(settings: RedisSettings, database: int) -> redis_async.Redis:
+    """Create a deadline-bounded client without implicit command retries."""
+
+    connection_options = {
+        "db": database,
+        "decode_responses": True,
+        "socket_connect_timeout": settings.connect_timeout_seconds,
+        "socket_timeout": settings.socket_timeout_seconds,
+        "retry": Retry(NoBackoff(), 0),
+    }
+    if settings.unix_socket:
+        return redis_async.Redis(
+            unix_socket_path=settings.unix_socket,
+            **connection_options,
+        )
+    return redis_async.Redis(
+        host=settings.host,
+        port=settings.port,
+        **connection_options,
+    )
+
+
 class RedisConfigRepository:
     """Persist a complete candidate and its reliable events in one MULTI/EXEC."""
 
@@ -81,24 +103,7 @@ class RedisConfigRepository:
             or self.settings.transaction_timeout_seconds <= 0
         ):
             raise ValueError("Redis deadlines must be positive")
-        connection_options = {
-            "db": CONFIG_DB,
-            "decode_responses": True,
-            "socket_connect_timeout": self.settings.connect_timeout_seconds,
-            "socket_timeout": self.settings.socket_timeout_seconds,
-            "retry": Retry(NoBackoff(), 0),
-        }
-        if self.settings.unix_socket:
-            self._client = redis_async.Redis(
-                unix_socket_path=self.settings.unix_socket,
-                **connection_options,
-            )
-        else:
-            self._client = redis_async.Redis(
-                host=self.settings.host,
-                port=self.settings.port,
-                **connection_options,
-            )
+        self._client = create_redis_client(self.settings, CONFIG_DB)
         self._timestamp_factory = timestamp_factory
         self._event_id_factory = event_id_factory
 

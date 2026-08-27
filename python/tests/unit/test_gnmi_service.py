@@ -1,5 +1,8 @@
+import json
+
 import grpc
 import pytest
+from gnmi_server.get_transaction import GetTransaction
 from gnmi_server.path_parser import protobuf_path
 from gnmi_server.proto import gnmi_pb2, gnmi_pb2_grpc
 from gnmi_server.server import create_server
@@ -12,9 +15,18 @@ from gnmi_server.service import (
 )
 
 
+class FakeGetRepository:
+    async def read_many(self, paths, request_type):
+        del request_type
+        return tuple({"name": path.device, "oper-status": "UP"} for path in paths)
+
+    async def close(self) -> None:
+        pass
+
+
 @pytest.fixture
 async def gnmi_stub():
-    service = GnmiService()
+    service = GnmiService(get_transaction=GetTransaction(FakeGetRepository()))
     server, port = create_server("127.0.0.1:0", service)
     await server.start()
     channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
@@ -48,17 +60,20 @@ async def test_invalid_get_path_maps_to_invalid_argument(gnmi_stub) -> None:
     assert raised.value.details().startswith("invalid path:")
 
 
-async def test_valid_get_is_explicitly_deferred(gnmi_stub) -> None:
+async def test_valid_get_returns_json_ietf(gnmi_stub) -> None:
     request = gnmi_pb2.GetRequest(
         path=[protobuf_path("/ocs/devices/device[name=ocs0]/state")],
         encoding=gnmi_pb2.JSON_IETF,
     )
 
-    with pytest.raises(grpc.aio.AioRpcError) as raised:
-        await gnmi_stub.Get(request, timeout=1.0)
+    response = await gnmi_stub.Get(request, timeout=1.0)
 
-    assert raised.value.code() is grpc.StatusCode.UNIMPLEMENTED
-    assert raised.value.details() == "Get is not implemented in Iteration 31"
+    assert len(response.notification) == 1
+    assert len(response.notification[0].update) == 1
+    assert json.loads(response.notification[0].update[0].val.json_ietf_val) == {
+        "name": "ocs0",
+        "oper-status": "UP",
+    }
 
 
 async def test_invalid_set_path_maps_to_invalid_argument(gnmi_stub) -> None:

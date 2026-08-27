@@ -65,6 +65,29 @@ Integration tests keep Redis on an internal Docker network with protected mode
 enabled and no published TCP port. A random temporary Unix socket is mounted for
 the test process and removed together with all Compose resources after the run.
 
+## gNMI operational reads
+
+Get reads desired configuration from CONFIG_DB, confirmed device and port state
+from STATE_DB, counters from COUNTERS_DB, and active alarms from ALARM_DB. One
+bounded request deadline covers all Redis operations, and Redis clients do not
+perform implicit retries. Dependency timeouts and failures map to
+`DEADLINE_EXCEEDED` and `UNAVAILABLE` respectively.
+
+Responses use `TypedValue.json_ietf_val`. Redis field names are exposed with
+kebab-case JSON names, known numeric fields are JSON numbers, lower-case Redis
+booleans are JSON booleans, and collection entries are ordered by device or
+resource ID. A connection container has `connection`, a port container has
+`input-port` and `output-port`, an alarm container has `alarm`, and a keyed
+connection combines its available `config` and `state` objects. CONFIG and
+STATE/OPERATIONAL Get types filter those combined objects.
+
+The unkeyed `/ocs/devices` collection is valid when empty. Keyed device,
+connection, port, counter, and alarm reads return `NOT_FOUND` when the selected
+resource snapshot is absent. A container below an existing device is valid when
+empty, while the same container below a missing device returns `NOT_FOUND`.
+Malformed paths, incompatible Get types, unsupported models, and encodings other
+than JSON_IETF return `INVALID_ARGUMENT` before Redis is read.
+
 ## Device synchronization contract
 
 `ocs-syncd` consumes `OCS_DEVICE_COMMANDS` in DEVICE_DB through the

@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Final
 
 import grpc
 
 from gnmi_server import __version__
-from gnmi_server.errors import InvalidArgumentError, abort_rpc
-from gnmi_server.path_parser import parse_paths
+from gnmi_server.errors import abort_rpc
+from gnmi_server.get_repository import RedisGetRepository
+from gnmi_server.get_transaction import GetTransaction
 from gnmi_server.proto import gnmi_pb2, gnmi_pb2_grpc
 from gnmi_server.redis_repository import RedisConfigRepository
 from gnmi_server.set_transaction import SetOperationKind, SetTransaction
@@ -21,13 +23,18 @@ GNMI_VERSION: Final = gnmi_pb2.DESCRIPTOR.GetOptions().Extensions[gnmi_pb2.gnmi_
 
 
 class GnmiService(gnmi_pb2_grpc.gNMIServicer):
-    """gNMI management surface with atomic desired-state Set handling."""
+    """gNMI management surface for desired configuration and operational state."""
 
-    def __init__(self, set_transaction: SetTransaction | None = None) -> None:
+    def __init__(
+        self,
+        set_transaction: SetTransaction | None = None,
+        get_transaction: GetTransaction | None = None,
+    ) -> None:
         self._set_transaction = set_transaction or SetTransaction(RedisConfigRepository())
+        self._get_transaction = get_transaction or GetTransaction(RedisGetRepository())
 
     async def close(self) -> None:
-        await self._set_transaction.close()
+        await asyncio.gather(self._set_transaction.close(), self._get_transaction.close())
 
     async def Capabilities(
         self,
@@ -53,12 +60,10 @@ class GnmiService(gnmi_pb2_grpc.gNMIServicer):
         context: grpc.aio.ServicerContext,
     ) -> gnmi_pb2.GetResponse:
         try:
-            if not request.path:
-                raise InvalidArgumentError("GetRequest requires at least one path")
-            parse_paths(request.path, prefix=request.prefix)
+            return await self._get_transaction.read(request)
         except Exception as error:
             await abort_rpc(context, error)
-        await context.abort(grpc.StatusCode.UNIMPLEMENTED, "Get is not implemented in Iteration 31")
+            raise AssertionError("gRPC abort returned unexpectedly") from error
 
     async def Set(
         self,
@@ -96,6 +101,6 @@ class GnmiService(gnmi_pb2_grpc.gNMIServicer):
         del request_iterator
         await context.abort(
             grpc.StatusCode.UNIMPLEMENTED,
-            "Subscribe is not implemented in Iteration 31",
+            "Subscribe is not implemented in Iteration 32",
         )
         yield gnmi_pb2.SubscribeResponse()
