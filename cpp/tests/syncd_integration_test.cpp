@@ -136,6 +136,7 @@ TEST_F(SyncdIntegrationTest, AppliesCommandPublishesStateAndResultThenAcknowledg
     const auto counters = counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"));
     EXPECT_EQ(counters.at("device_apply_total"), "1");
     EXPECT_EQ(counters.at("device_apply_success_total"), "1");
+    EXPECT_EQ(counters.at("active_connections"), "1");
 
     const auto results = device_db_->readGroup(
         std::string(ocs::redis::kDeviceResults), result_group, "result-consumer");

@@ -141,6 +141,10 @@ void SyncdService::publishState(
     const ApplyResult& result) {
     for (const auto& command : batch.commands) {
         const auto state_key = redis::connectionStateKey(command_event.device, command.id);
+        const auto previous_state = state_db_.getHash(state_key);
+        const auto previous_status = previous_state.find("apply_status");
+        const bool was_active = previous_status != previous_state.end() &&
+                                previous_status->second == "ACTIVE";
         std::map<std::string, std::string> state;
         std::string operation = "UPSERT";
         if (result.ok() && command.operation == ConnectionOperation::kRemove) {
@@ -198,6 +202,15 @@ void SyncdService::publishState(
             state,
             std::string(redis::kStateEvents),
             state_event);
+        if (result.ok()) {
+            const bool is_active = command.operation != ConnectionOperation::kRemove;
+            if (was_active != is_active) {
+                static_cast<void>(counters_db_.incrementHashField(
+                    redis::deviceCountersKey(command_event.device),
+                    "active_connections",
+                    is_active ? 1 : -1));
+            }
+        }
     }
 }
 
