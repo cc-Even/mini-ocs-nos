@@ -50,6 +50,34 @@ async def _stop_process(process: asyncio.subprocess.Process) -> str:
     return output.decode("utf-8", errors="replace")
 
 
+def _archive_process_logs(name: str, logs: list[str]) -> None:
+    configured = os.getenv("OCS_TEST_LOG_DIR")
+    if configured is None:
+        return
+    log_directory = Path(configured)
+    log_directory.mkdir(parents=True, exist_ok=True)
+    sections = [f"=== process {index} ===\n{output}" for index, output in enumerate(logs)]
+    (log_directory / f"{name}-services.log").write_text(
+        "\n".join(sections), encoding="utf-8"
+    )
+
+
+async def _read_until(
+    stream: asyncio.StreamReader,
+    marker: bytes,
+    *,
+    timeout_seconds: float,
+) -> bytes:
+    captured = bytearray()
+    async with asyncio.timeout(timeout_seconds):
+        while marker not in captured:
+            line = await stream.readline()
+            if not line:
+                raise RuntimeError(f"process exited before emitting {marker.decode()}")
+            captured.extend(line)
+    return bytes(captured)
+
+
 async def _run_cli(target: str, *arguments: str) -> tuple[int, str, str]:
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(REPOSITORY_ROOT / "python")
@@ -135,6 +163,7 @@ async def test_blocked_device_poll_keeps_syncd_process_heartbeat_fresh(
             hwsim.send_signal(signal.SIGCONT)
         for process in reversed(processes):
             logs.append(await _stop_process(process))
+        _archive_process_logs("blocked-device-poll", logs)
         await asyncio.gather(config.aclose(), state.aclose())
         if any(process.returncode not in {0, -15} for process in processes):
             pytest.fail("blocked-poll service failed:\n" + "\n".join(logs))
@@ -384,6 +413,7 @@ async def test_scenarios_a_b_and_h_through_ocsctl_and_gnmi(tmp_path: Path) -> No
 
         watch_environment = os.environ.copy()
         watch_environment["PYTHONPATH"] = str(REPOSITORY_ROOT / "python")
+        watch_environment["PYTHONUNBUFFERED"] = "1"
         watch = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
@@ -401,7 +431,12 @@ async def test_scenarios_a_b_and_h_through_ocsctl_and_gnmi(tmp_path: Path) -> No
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        await asyncio.sleep(0.3)
+        assert watch.stdout is not None
+        initial_watch_output = await _read_until(
+            watch.stdout,
+            b'"sync-response": true',
+            timeout_seconds=2.0,
+        )
         code, _, stderr = await _run_cli(
             target,
             "connection",
@@ -416,8 +451,9 @@ async def test_scenarios_a_b_and_h_through_ocsctl_and_gnmi(tmp_path: Path) -> No
         assert code == 0, stderr
         watch_stdout, watch_stderr = await watch.communicate()
         assert watch.returncode == 0, watch_stderr.decode()
-        assert '"sync-response": true' in watch_stdout.decode()
-        assert '"applied-version": 3' in watch_stdout.decode()
+        complete_watch_output = (initial_watch_output + watch_stdout).decode()
+        assert '"sync-response": true' in complete_watch_output
+        assert '"applied-version": 3' in complete_watch_output
 
         code, _, stderr = await _run_cli(target, "connection", "delete", "ocs0", "conn-2")
         assert code == 0, stderr
@@ -468,6 +504,7 @@ async def test_scenarios_a_b_and_h_through_ocsctl_and_gnmi(tmp_path: Path) -> No
         await service.close()
         for process in reversed(processes):
             process_logs.append(await _stop_process(process))
+        _archive_process_logs("management-e2e", process_logs)
         for client in cleanup_clients:
             await client.aclose()
         if any(process.returncode not in {0, -15} for process in processes):

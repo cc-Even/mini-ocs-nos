@@ -66,6 +66,8 @@ target_include_directories(
 target_compile_features(ocs_core PUBLIC cxx_std_20)
 target_link_libraries(
     ocs_core
+    PUBLIC
+        ocs_sanitizers
     PRIVATE
         nlohmann_json::nlohmann_json
         redis++::redis++_static
@@ -124,6 +126,7 @@ if(BUILD_TESTING)
 
     add_executable(
         ocs_core_test
+        tests/contracts_test.cpp
         tests/device_test.cpp
         tests/orchestrator_test.cpp
         tests/reconciler_test.cpp

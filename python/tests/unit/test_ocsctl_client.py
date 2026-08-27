@@ -4,6 +4,8 @@ import ast
 import json
 from pathlib import Path
 
+import pytest
+from gnmi_server.path_parser import protobuf_path
 from gnmi_server.proto import gnmi_pb2
 from ocsctl.client import ConnectionSpec, GnmiClient, connection_path
 from ocsctl.main import app
@@ -109,6 +111,124 @@ async def test_client_builds_update_replace_and_delete_requests() -> None:
     assert replaced["operations"][0]["operation"] == "REPLACE"
     assert deleted["operations"][0]["operation"] == "DELETE"
     assert all(call[2] == 2.0 for call in stub.calls)
+
+
+async def test_client_validates_deadline_batch_and_get_response_shape() -> None:
+    with pytest.raises(ValueError, match="timeout_seconds must be positive"):
+        GnmiClient(timeout_seconds=0)
+
+    client = GnmiClient(timeout_seconds=1.0, stub=FakeStub())
+    with pytest.raises(ValueError, match="at least one connection"):
+        await client.set_connections("ocs0", [])
+
+    class InvalidGetStub(FakeStub):
+        def __init__(self, response: gnmi_pb2.GetResponse) -> None:
+            super().__init__()
+            self.response = response
+
+        async def Get(self, request, *, timeout):
+            self.calls.append(("get", request, timeout))
+            return self.response
+
+    path = connection_path("ocs0", "conn-1", "state")
+    malformed_responses = (
+        gnmi_pb2.GetResponse(),
+        gnmi_pb2.GetResponse(
+            notification=[
+                gnmi_pb2.Notification(
+                    update=[
+                        gnmi_pb2.Update(
+                            val=gnmi_pb2.TypedValue(string_val="not-json-ietf")
+                        )
+                    ]
+                )
+            ]
+        ),
+    )
+    for response in malformed_responses:
+        invalid_client = GnmiClient(stub=InvalidGetStub(response))
+        with pytest.raises(RuntimeError, match="gNMI Get"):
+            await invalid_client.get(path)
+
+
+async def test_wait_for_connection_and_subscribe_decode_operational_events() -> None:
+    client = GnmiClient(timeout_seconds=1.0, stub=FakeStub())
+    state = await client.wait_for_connection("ocs0", "conn-1")
+    assert state["apply-status"] == "ACTIVE"
+
+    path = connection_path("ocs0", "conn-1", "state")
+    protobuf_state_path = protobuf_path(path)
+
+    class FakeSubscribeCall:
+        def __init__(self) -> None:
+            self.cancelled = False
+            self.responses = iter(
+                (
+                    gnmi_pb2.SubscribeResponse(sync_response=True),
+                    gnmi_pb2.SubscribeResponse(
+                        update=gnmi_pb2.Notification(
+                            timestamp=789,
+                            update=[
+                                gnmi_pb2.Update(
+                                    path=protobuf_state_path,
+                                    val=gnmi_pb2.TypedValue(
+                                        json_ietf_val=b'{"apply-status":"ACTIVE"}'
+                                    ),
+                                )
+                            ],
+                        )
+                    ),
+                    gnmi_pb2.SubscribeResponse(
+                        update=gnmi_pb2.Notification(
+                            timestamp=790,
+                            delete=[protobuf_state_path],
+                        )
+                    ),
+                )
+            )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.responses)
+            except StopIteration as error:
+                raise StopAsyncIteration from error
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    class FakeSubscribeStub:
+        def __init__(self) -> None:
+            self.call = FakeSubscribeCall()
+            self.requests = None
+            self.timeout = None
+
+        def Subscribe(self, requests, *, timeout):
+            self.requests = requests
+            self.timeout = timeout
+            return self.call
+
+    stub = FakeSubscribeStub()
+    subscribing_client = GnmiClient(timeout_seconds=2.0, stub=stub)
+    events = [event async for event in subscribing_client.subscribe(path)]
+
+    assert events == [
+        {"sync-response": True},
+        {
+            "timestamp": 789,
+            "path": path,
+            "value": {"apply-status": "ACTIVE"},
+        },
+        {"timestamp": 790, "path": path, "deleted": True},
+    ]
+    assert stub.timeout == 2.0
+    assert stub.call.cancelled is True
+    request = await anext(stub.requests)
+    assert request.subscribe.mode == gnmi_pb2.SubscriptionList.STREAM
+    assert request.subscribe.subscription[0].mode == gnmi_pb2.ON_CHANGE
+    await stub.requests.aclose()
 
 
 def test_cli_exposes_management_commands_and_has_no_redis_imports() -> None:

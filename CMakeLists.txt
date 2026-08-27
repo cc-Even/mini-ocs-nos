@@ -14,4 +14,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+option(OCS_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+add_library(ocs_sanitizers INTERFACE)
+if(OCS_ENABLE_SANITIZERS)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            ocs_sanitizers
+            INTERFACE
+                -fsanitize=address,undefined
+                -fno-omit-frame-pointer
+        )
+        target_link_options(ocs_sanitizers INTERFACE -fsanitize=address,undefined)
+    else()
+        message(FATAL_ERROR "OCS_ENABLE_SANITIZERS requires GCC or Clang")
+    endif()
+endif()
+
 add_subdirectory(cpp)

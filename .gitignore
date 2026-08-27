@@ -1,6 +1,7 @@
 # CMake and C++ build outputs
 /build/
 /out/
+/artifacts/
 compile_commands.json
 
 # Python environments and caches

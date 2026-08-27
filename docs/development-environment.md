@@ -38,3 +38,23 @@ not sufficient. A native Docker Engine installation is also supported when both
 the 3.12 line when bootstrap is rerun, while the `uv` tool itself remains pinned.
 Application dependencies will be locked separately by the Python project in
 Iteration 02.
+
+## Hardened test profiles
+
+Run the complete non-Redis regression with `make test`. Run the C++ suite under
+AddressSanitizer and UndefinedBehaviorSanitizer with:
+
+```bash
+make sanitizer-test
+```
+
+The sanitizer preset uses a separate `build/sanitizer` tree, keeps frame
+pointers, enables leak detection, and stops on the first ASan or UBSan finding.
+It requires GCC or Clang. With Docker available, run
+`make sanitizer-integration-test` to execute the Redis-dependent orch/syncd
+suite with the same instrumentation.
+
+`make redis-integration-test` writes command output, Redis container logs, and
+captured service-process logs below `artifacts/test-logs/redis-integration`.
+The directory is intentionally ignored by Git; CI uploads it when a test job
+fails so the local worktree remains clean after successful acceptance runs.

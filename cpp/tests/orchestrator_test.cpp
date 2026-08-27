@@ -879,15 +879,12 @@ TEST_F(OrchestratorIntegrationTest, ApplyTimeoutRaisesAlarmAndRecoversAfterDurab
         endpoint_, std::make_unique<ocs::UdsDeviceBackend>(hwsim_socket_));
     syncd_->initialize();
 
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    bool retry_published = false;
-    while (!retry_published && std::chrono::steady_clock::now() < deadline) {
-        retry_published = orch_->processRetryOne("orch-timeout-retry");
-        if (!retry_published) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        }
-    }
-    ASSERT_TRUE(retry_published);
+    const auto retry = appl_db_->getHash(
+        ocs::redis::connectionAppKey("ocs0", "conn-timeout-recovery-001"));
+    const auto retry_at = std::chrono::system_clock::time_point(
+        std::chrono::nanoseconds(std::stoull(retry.at("next_retry_at_ns"))));
+    std::this_thread::sleep_until(retry_at);
+    ASSERT_TRUE(orch_->processRetryOne("orch-timeout-retry"));
     ASSERT_TRUE(syncd_->processOne("syncd-timeout-retry"));
     ASSERT_TRUE(orch_->processResultOne("orch-timeout-retry-result"));
 

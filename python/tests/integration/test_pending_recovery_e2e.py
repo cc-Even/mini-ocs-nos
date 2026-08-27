@@ -55,6 +55,18 @@ async def _stop(process: asyncio.subprocess.Process) -> str:
     return output.decode("utf-8", errors="replace")
 
 
+def _archive_process_logs(name: str, logs: list[str]) -> None:
+    configured = os.getenv("OCS_TEST_LOG_DIR")
+    if configured is None:
+        return
+    log_directory = Path(configured)
+    log_directory.mkdir(parents=True, exist_ok=True)
+    sections = [f"=== process {index} ===\n{output}" for index, output in enumerate(logs)]
+    (log_directory / f"{name}-services.log").write_text(
+        "\n".join(sections), encoding="utf-8"
+    )
+
+
 async def test_crashed_syncd_claims_pending_without_duplicate_side_effects(
     tmp_path: Path,
 ) -> None:
@@ -160,6 +172,7 @@ async def test_crashed_syncd_claims_pending_without_duplicate_side_effects(
         await service.close()
         for process in reversed(processes):
             logs.append(await _stop(process))
+        _archive_process_logs("pending-recovery-e2e", logs)
         for client in clients.values():
             await client.aclose()
         unexpected = [

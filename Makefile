@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := build
 
-.PHONY: bootstrap configure build cpp-test generate-protos python-sync python-test lint test up redis-test redis-integration-test down
+.PHONY: bootstrap configure build cpp-test sanitizer-test sanitizer-integration-test generate-protos python-sync python-test lint test up redis-test redis-integration-test down
 
 bootstrap:
 	./scripts/bootstrap.sh
@@ -13,6 +13,21 @@ build: configure python-sync
 
 cpp-test: build
 	ctest --preset dev
+
+sanitizer-test:
+	cmake --preset sanitizer
+	cmake --build --preset sanitizer
+	ctest --preset sanitizer
+
+sanitizer-integration-test:
+	cmake --preset sanitizer
+	cmake --build --preset sanitizer
+	OCS_CTEST_DIR=build/sanitizer \
+	OCS_RUN_PYTHON_INTEGRATION=0 \
+	OCS_TEST_LOG_DIR=artifacts/test-logs/sanitizer-integration \
+	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+	./scripts/test-redis-contracts.sh
 
 generate-protos: python-sync
 	./scripts/generate-protos.sh
