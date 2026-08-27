@@ -9,8 +9,10 @@
 #include <functional>
 #include <memory>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace ocs {
 
@@ -75,6 +77,27 @@ private:
         const DeviceInfo& info,
         std::string_view command_id,
         std::uint64_t desired_version);
+    [[nodiscard]] std::vector<AppliedConnection> pollPortStates(
+        const DeviceInfo& info,
+        const std::vector<AppliedConnection>& actual);
+    void publishPortState(
+        const DeviceInfo& info,
+        const PortState& port,
+        std::size_t affected_connections);
+    void publishPortAlarm(
+        const DeviceInfo& info,
+        const PortState& port,
+        std::string_view activation_id,
+        std::size_t affected_connections);
+    void clearPortAlarm(
+        const DeviceInfo& info,
+        const PortState& port,
+        std::string_view activation_id);
+    [[nodiscard]] std::vector<std::pair<std::string, std::map<std::string, std::string>>>
+    portFaults(std::string_view device);
+    void associatePortFaults(
+        const DeviceInfo& info,
+        std::string_view command_id);
 
     redis::RedisRepository device_db_;
     redis::RedisRepository state_db_;

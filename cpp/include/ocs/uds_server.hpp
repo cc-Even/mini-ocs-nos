@@ -5,8 +5,10 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace ocs {
 
@@ -23,6 +25,12 @@ public:
     [[nodiscard]] bool running() const noexcept;
 
 private:
+    struct ClientWorker {
+        int fd{-1};
+        std::shared_ptr<std::atomic<bool>> done;
+        std::jthread thread;
+    };
+
     void acceptLoop(std::stop_token stop_token);
     void serveClient(int client_fd, std::stop_token stop_token);
     [[nodiscard]] uds::Frame dispatch(const uds::Frame& request);
@@ -30,9 +38,10 @@ private:
     std::string socket_path_;
     std::shared_ptr<SimulatedOcsDevice> device_;
     std::atomic<int> listen_fd_{-1};
-    std::atomic<int> client_fd_{-1};
     std::atomic<bool> owns_socket_{false};
     std::jthread worker_;
+    std::mutex clients_mutex_;
+    std::vector<ClientWorker> client_workers_;
 };
 
 }  // namespace ocs

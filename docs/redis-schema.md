@@ -237,6 +237,24 @@ control record to `CONVERGED`. The simulator-only `OUT_OF_BAND_DRIFT` fault
 removes a deterministic actual connection without changing its version fence,
 providing the supported scenario-G test path without manipulating Redis.
 
+The device poll also reads every input and output port through deadline-bounded
+UDS calls. Initial `OCS_INPUT_PORT_STATE|device|id` and
+`OCS_OUTPUT_PORT_STATE|device|id` snapshots are installed without replaying
+synthetic changes; later changes atomically replace the snapshot and append an
+`input-port` or `output-port` event to `OCS_STATE_EVENTS`. A non-UP port is
+excluded from the effective connection matrix, so every affected connection
+enters the normal DRIFTED/RECONCILING full-snapshot path.
+
+`OCS_SYNCD_PORT_FAULT|device|direction|id` durably records each ACTIVE,
+CLEARED, RECOVERY_PUBLISHED, and RECOVERED fault cycle. A DOWN transition raises
+`port-down-direction-id`, increments `port_down_total` once, and accounts for
+the alarm once across ALARM_DB and COUNTERS_DB. Applying the full snapshot while
+the fault remains active fails with `OCS_PORT_DOWN` without changing hardware.
+After the port returns UP, a failed same-version connection is reapplied once;
+successful device confirmation restores ACTIVE and clears both the port and
+drift alarms. Standalone hwsim accepts concurrent syncd and simulator-only
+control sessions so scenario H never mutates Redis to inject or clear a fault.
+
 Each syncd loop first performs a bounded XPENDING scan and XCLAIM for commands
 whose idle time exceeds `OCS_SYNCD_PENDING_MIN_IDLE_MS` (five seconds by
 default), then reads a new command. The claim threshold is configurable for

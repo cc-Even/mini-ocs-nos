@@ -129,13 +129,18 @@ void UdsServer::stop() {
         ::shutdown(server_fd, SHUT_RDWR);
         ::close(server_fd);
     }
-    const int client_fd = client_fd_.exchange(-1);
-    if (client_fd >= 0) {
-        ::shutdown(client_fd, SHUT_RDWR);
-        ::close(client_fd);
-    }
     if (worker_.joinable()) {
         worker_.join();
+    }
+    {
+        std::scoped_lock lock(clients_mutex_);
+        for (auto& client_worker : client_workers_) {
+            client_worker.thread.request_stop();
+            if (!client_worker.done->load()) {
+                static_cast<void>(::shutdown(client_worker.fd, SHUT_RDWR));
+            }
+        }
+        client_workers_.clear();
     }
     if (owns_socket_.exchange(false)) {
         struct stat status {};
@@ -162,11 +167,19 @@ void UdsServer::acceptLoop(std::stop_token stop_token) {
             }
             break;
         }
-        client_fd_.store(client_fd);
-        serveClient(client_fd, stop_token);
-        int expected = client_fd;
-        if (client_fd_.compare_exchange_strong(expected, -1)) {
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        std::jthread client_worker([this, client_fd, done](std::stop_token client_stop) {
+            serveClient(client_fd, client_stop);
+            done->store(true);
             ::close(client_fd);
+        });
+        std::scoped_lock lock(clients_mutex_);
+        std::erase_if(client_workers_, [](const ClientWorker& worker) {
+            return worker.done->load();
+        });
+        client_workers_.push_back({client_fd, std::move(done), std::move(client_worker)});
+        if (stop_token.stop_requested()) {
+            break;
         }
     }
 }

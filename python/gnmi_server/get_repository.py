@@ -37,6 +37,7 @@ from gnmi_server.redis_keys import (
 from gnmi_server.redis_repository import RedisSettings, create_redis_client
 
 _INTEGER_FIELDS: Final = {
+    "affected_connection_count",
     "active_alarms",
     "active_connections",
     "actual_connection_count",
@@ -51,6 +52,7 @@ _INTEGER_FIELDS: Final = {
     "last_change_ns",
     "output_port",
     "output_port_count",
+    "port_id",
     "timestamp_ns",
     "updated_at_ns",
 }

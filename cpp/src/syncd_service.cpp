@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -118,6 +119,34 @@ bool isReconciliation(std::string_view command_id) {
     return command_id.starts_with("reconcile:");
 }
 
+std::string_view portDirectionName(PortDirection direction) {
+    return direction == PortDirection::kInput ? "input" : "output";
+}
+
+std::string_view portResourceType(PortDirection direction) {
+    return direction == PortDirection::kInput ? "input-port" : "output-port";
+}
+
+std::string_view portOperStatusName(PortOperStatus status) {
+    switch (status) {
+        case PortOperStatus::kUp:
+            return "UP";
+        case PortOperStatus::kDown:
+            return "DOWN";
+        case PortOperStatus::kLowPower:
+            return "LOW_POWER";
+        case PortOperStatus::kFault:
+            return "FAULT";
+        case PortOperStatus::kUnknown:
+            return "UNKNOWN";
+    }
+    return "UNKNOWN";
+}
+
+bool portUnavailable(const PortState& port) {
+    return !port.admin_enabled || port.oper_status != PortOperStatus::kUp;
+}
+
 }  // namespace
 
 SyncdService::SyncdService(
@@ -164,6 +193,7 @@ void SyncdService::initialize() {
     device_name_ = info.name;
     device_generation_ = info.generation;
     const auto actual = device_->getConnections();
+    static_cast<void>(pollPortStates(info, actual));
     const auto existing_state = state_db_.getHash(redis::deviceStateKey(info.name));
     if (existing_state.empty()) {
         state_db_.putHash(
@@ -196,6 +226,7 @@ bool SyncdService::pollDevice() {
             throw std::runtime_error("connected device identity changed after handshake");
         }
         const auto actual = device_->getConnections();
+        const auto effective_actual = pollPortStates(info, actual);
         const auto state = state_db_.getHash(redis::deviceStateKey(info.name));
         const auto generation = state.find("device_generation");
         const bool generation_changed = generation == state.end() ||
@@ -220,7 +251,7 @@ bool SyncdService::pollDevice() {
                         generation_recovery.at("command_id")))
                     .empty();
             if (!recovery_pending) {
-                reconcileDevice(info, actual);
+                reconcileDevice(info, effective_actual);
             }
         }
         if (generation_changed || actual_count_changed || status == state.end() ||
@@ -578,6 +609,267 @@ bool SyncdService::orchestrationSettled(
     return desired_by_id.empty();
 }
 
+std::vector<AppliedConnection> SyncdService::pollPortStates(
+    const DeviceInfo& info,
+    const std::vector<AppliedConnection>& actual) {
+    std::unordered_set<PortId> unavailable_inputs;
+    std::unordered_set<PortId> unavailable_outputs;
+    const auto poll_direction = [&](PortDirection direction, PortId count) {
+        for (PortId id = 1; id <= count; ++id) {
+            const auto port = direction == PortDirection::kInput
+                                  ? device_->getInputPortState(id)
+                                  : device_->getOutputPortState(id);
+            const auto affected = static_cast<std::size_t>(std::ranges::count_if(
+                actual,
+                [&port](const AppliedConnection& connection) {
+                    return port.direction == PortDirection::kInput
+                               ? connection.input_port == port.id
+                               : connection.output_port == port.id;
+                }));
+            publishPortState(info, port, affected);
+            if (portUnavailable(port)) {
+                (direction == PortDirection::kInput ? unavailable_inputs
+                                                    : unavailable_outputs)
+                    .insert(id);
+            }
+        }
+    };
+    poll_direction(PortDirection::kInput, info.input_port_count);
+    poll_direction(PortDirection::kOutput, info.output_port_count);
+
+    std::vector<AppliedConnection> effective;
+    effective.reserve(actual.size());
+    std::ranges::copy_if(actual, std::back_inserter(effective), [&](const auto& connection) {
+        return !unavailable_inputs.contains(connection.input_port) &&
+               !unavailable_outputs.contains(connection.output_port);
+    });
+    return effective;
+}
+
+void SyncdService::publishPortState(
+    const DeviceInfo& info,
+    const PortState& port,
+    std::size_t affected_connections) {
+    const auto direction = std::string(portDirectionName(port.direction));
+    const auto port_id = std::to_string(port.id);
+    const auto state_key = port.direction == PortDirection::kInput
+                               ? redis::inputPortStateKey(info.name, port_id)
+                               : redis::outputPortStateKey(info.name, port_id);
+    const auto previous = state_db_.getHash(state_key);
+    std::map<std::string, std::string> fields{
+        {"device", info.name},
+        {"id", port_id},
+        {"direction", direction},
+        {"admin_enabled", port.admin_enabled ? "true" : "false"},
+        {"oper_status", std::string(portOperStatusName(port.oper_status))},
+        {"optical_power_dbm", std::to_string(port.optical_power_dbm)},
+    };
+    const bool changed = previous.empty() ||
+                         std::ranges::any_of(fields, [&previous](const auto& field) {
+                             const auto found = previous.find(field.first);
+                             return found == previous.end() || found->second != field.second;
+                         });
+    if (changed) {
+        const auto timestamp = timestampNowNs();
+        fields["last_change_ns"] = std::to_string(timestamp);
+        if (previous.empty()) {
+            state_db_.putHash(state_key, fields);
+        } else {
+            const redis::EventEnvelope event{
+                .event_schema_version = 1,
+                .event_id = "syncd-port:" + info.name + ":" + direction + ":" + port_id + ":" +
+                            std::to_string(timestamp),
+                .request_id = "syncd-port-health:" + info.name,
+                .timestamp_ns = timestamp,
+                .device = info.name,
+                .resource_type = std::string(portResourceType(port.direction)),
+                .resource_id = port_id,
+                .operation = "UPSERT",
+                .desired_version = 0,
+                .payload = statePayload(fields),
+            };
+            state_db_.replaceHashAndAppendEvent(
+                state_key, fields, std::string(redis::kStateEvents), event);
+        }
+    }
+
+    const auto fault_key = redis::syncdPortFaultKey(info.name, direction, port_id);
+    auto fault = device_db_.getHash(fault_key);
+    if (portUnavailable(port)) {
+        if (fault.empty() || !fault.contains("status") || fault.at("status") == "RECOVERED") {
+            const auto activation_id = "port-fault:" + info.name + ":" + direction + ":" +
+                                       port_id + ":" + std::to_string(timestampNowNs());
+            fault = {
+                {"device", info.name},
+                {"direction", direction},
+                {"port_id", port_id},
+                {"activation_id", activation_id},
+                {"status", "ACTIVE"},
+                {"raised_at_ns", std::to_string(timestampNowNs())},
+            };
+            device_db_.putHash(fault_key, fault);
+        }
+        publishPortAlarm(info, port, fault.at("activation_id"), affected_connections);
+        return;
+    }
+    if (fault.empty() || !fault.contains("status") || fault.at("status") == "RECOVERED") {
+        return;
+    }
+
+    clearPortAlarm(info, port, fault.at("activation_id"));
+    fault["cleared_at_ns"] = std::to_string(timestampNowNs());
+    if (fault.at("status") == "ACTIVE") {
+        fault["status"] = "CLEARED";
+    } else if (fault.at("status") == "RECOVERY_PUBLISHED" &&
+               fault.contains("command_id")) {
+        const auto processed = device_db_.getHash(
+            redis::processedDeviceCommandKey(fault.at("command_id")));
+        if (!processed.empty()) {
+            fault["status"] = processed.contains("applied") &&
+                                      processed.at("applied") == "true"
+                                  ? "RECOVERED"
+                                  : "CLEARED";
+        } else {
+            fault["cleared"] = "true";
+        }
+    }
+    device_db_.putHash(fault_key, fault);
+}
+
+void SyncdService::publishPortAlarm(
+    const DeviceInfo& info,
+    const PortState& port,
+    std::string_view activation_id,
+    std::size_t affected_connections) {
+    const auto direction = std::string(portDirectionName(port.direction));
+    const auto port_id = std::to_string(port.id);
+    const auto alarm_id = redis::portDownAlarmId(direction, port_id);
+    const auto alarm_key = redis::activeAlarmKey(info.name, alarm_id);
+    const auto marker_key = redis::syncdPortAlarmPublicationKey(activation_id);
+    if (alarm_db_.getHash(marker_key).empty()) {
+        const auto now = timestampNowNs();
+        const std::map<std::string, std::string> fields{
+            {"id", alarm_id},
+            {"active", "true"},
+            {"severity", "MAJOR"},
+            {"resource_type", std::string(portResourceType(port.direction))},
+            {"resource_id", port_id},
+            {"direction", direction},
+            {"port_id", port_id},
+            {"affected_connection_count", std::to_string(affected_connections)},
+            {"error_code", std::string(toString(port.admin_enabled ? ErrorCode::kPortDown
+                                                                    : ErrorCode::kPortDisabled))},
+            {"error_message", "port is not operationally available"},
+            {"activation_id", std::string(activation_id)},
+            {"first_raised_ns", std::to_string(now)},
+            {"last_change_ns", std::to_string(now)},
+        };
+        const redis::EventEnvelope event{
+            .event_schema_version = 1,
+            .event_id = std::string(activation_id) + ":alarm",
+            .request_id = std::string(activation_id),
+            .timestamp_ns = now,
+            .device = info.name,
+            .resource_type = "alarm",
+            .resource_id = alarm_id,
+            .operation = "UPSERT",
+            .desired_version = 0,
+            .payload = statePayload(fields),
+        };
+        static_cast<void>(alarm_db_.replaceHashAndAppendEventOnce(
+            marker_key,
+            {{"activation_id", std::string(activation_id)}},
+            alarm_key,
+            fields,
+            std::string(redis::kAlarmEvents),
+            event));
+    }
+    static_cast<void>(counters_db_.incrementHashFieldsOnce(
+        redis::syncdPortAlarmCounterPublicationKey(activation_id, false),
+        {{"activation_id", std::string(activation_id)}},
+        redis::deviceCountersKey(info.name),
+        {{"active_alarms", 1}, {"port_down_total", 1}}));
+}
+
+void SyncdService::clearPortAlarm(
+    const DeviceInfo& info,
+    const PortState& port,
+    std::string_view activation_id) {
+    const auto direction = std::string(portDirectionName(port.direction));
+    const auto port_id = std::to_string(port.id);
+    const auto alarm_id = redis::portDownAlarmId(direction, port_id);
+    const auto alarm_key = redis::activeAlarmKey(info.name, alarm_id);
+    const auto marker_key = redis::syncdPortAlarmClearPublicationKey(activation_id);
+    auto marker = alarm_db_.getHash(marker_key);
+    if (marker.empty()) {
+        auto active = alarm_db_.getHash(alarm_key);
+        if (active.empty()) {
+            return;
+        }
+        const auto now = timestampNowNs();
+        active["active"] = "false";
+        active["last_change_ns"] = std::to_string(now);
+        const redis::EventEnvelope event{
+            .event_schema_version = 1,
+            .event_id = std::string(activation_id) + ":alarm-clear",
+            .request_id = std::string(activation_id),
+            .timestamp_ns = now,
+            .device = info.name,
+            .resource_type = "alarm",
+            .resource_id = alarm_id,
+            .operation = "REMOVE",
+            .desired_version = 0,
+            .payload = statePayload(active),
+        };
+        static_cast<void>(alarm_db_.replaceHashAndAppendEventOnce(
+            marker_key,
+            {{"activation_id", std::string(activation_id)}},
+            alarm_key,
+            {},
+            std::string(redis::kAlarmEvents),
+            event));
+        marker = alarm_db_.getHash(marker_key);
+    }
+    if (!marker.empty()) {
+        static_cast<void>(counters_db_.incrementHashFieldsOnce(
+            redis::syncdPortAlarmCounterPublicationKey(activation_id, true),
+            {{"activation_id", std::string(activation_id)}},
+            redis::deviceCountersKey(info.name),
+            {{"active_alarms", -1}}));
+    }
+}
+
+std::vector<std::pair<std::string, std::map<std::string, std::string>>>
+SyncdService::portFaults(std::string_view device) {
+    std::vector<std::pair<std::string, std::map<std::string, std::string>>> faults;
+    for (const auto& key : device_db_.scanKeys(redis::syncdPortFaultPattern(device))) {
+        auto fields = device_db_.getHash(key);
+        if (!fields.empty()) {
+            faults.emplace_back(key, std::move(fields));
+        }
+    }
+    return faults;
+}
+
+void SyncdService::associatePortFaults(
+    const DeviceInfo& info,
+    std::string_view command_id) {
+    std::vector<std::pair<std::string, std::map<std::string, std::string>>> updates;
+    for (auto& [key, fault] : portFaults(info.name)) {
+        if (!fault.contains("status") ||
+            (fault.at("status") != "ACTIVE" && fault.at("status") != "CLEARED")) {
+            continue;
+        }
+        fault["status"] = "RECOVERY_PUBLISHED";
+        fault["command_id"] = std::string(command_id);
+        fault["recovery_published_at_ns"] = std::to_string(timestampNowNs());
+        updates.emplace_back(key, std::move(fault));
+    }
+    if (!updates.empty()) {
+        device_db_.putHashesAtomically(updates);
+    }
+}
+
 void SyncdService::reconcileDevice(
     const DeviceInfo& info,
     const std::vector<AppliedConnection>& actual) {
@@ -586,6 +878,54 @@ void SyncdService::reconcileDevice(
         return;
     }
     auto plan = buildReconciliationPlan(desired, actual);
+    auto port_faults = portFaults(info.name);
+    const bool port_recovery_required = std::ranges::any_of(
+        port_faults,
+        [](const auto& item) {
+            return item.second.contains("status") && item.second.at("status") == "CLEARED";
+        });
+    if (plan.converged() && port_recovery_required) {
+        std::unordered_map<std::string, ConnectionCommand> desired_by_id;
+        std::unordered_map<std::string, AppliedConnection> actual_by_id;
+        for (const auto& command : desired) {
+            desired_by_id.emplace(command.id, command);
+        }
+        for (const auto& connection : actual) {
+            actual_by_id.emplace(connection.id, connection);
+        }
+        for (const auto& command : desired) {
+            const auto snapshot = state_db_.getHash(
+                redis::connectionStateKey(info.name, command.id));
+            if (!snapshot.contains("apply_status") || snapshot.at("apply_status") != "FAILED") {
+                continue;
+            }
+            const auto desired_item = desired_by_id.find(command.id);
+            const auto actual_item = actual_by_id.find(command.id);
+            if (desired_item == desired_by_id.end() || actual_item == actual_by_id.end()) {
+                continue;
+            }
+            plan.drifts.push_back({
+                .id = desired_item->first,
+                .kind = ConnectionDriftKind::kMismatched,
+                .desired = desired_item->second,
+                .actual = actual_item->second,
+            });
+        }
+        std::ranges::sort(plan.drifts, {}, &ConnectionDrift::id);
+        if (plan.converged()) {
+            std::vector<std::pair<std::string, std::map<std::string, std::string>>> recovered;
+            for (auto& [key, fault] : port_faults) {
+                if (fault.contains("status") && fault.at("status") == "CLEARED") {
+                    fault["status"] = "RECOVERED";
+                    fault["recovered_at_ns"] = std::to_string(timestampNowNs());
+                    recovered.emplace_back(key, std::move(fault));
+                }
+            }
+            if (!recovered.empty()) {
+                device_db_.putHashesAtomically(recovered);
+            }
+        }
+    }
     auto control = device_db_.getHash(redis::syncdReconciliationKey(info.name));
     if (plan.converged()) {
         if (!control.empty() && control.find("status") != control.end() &&
@@ -605,7 +945,10 @@ void SyncdService::reconcileDevice(
     auto batch = plan.full_snapshot;
     const auto signature = encodeDeviceCommand(batch);
     std::string command_id;
-    if (!control.empty() && control.contains("signature") &&
+    const bool reopen_failed_port_recovery =
+        port_recovery_required && control.contains("status") &&
+        control.at("status") == "FAILED";
+    if (!reopen_failed_port_recovery && !control.empty() && control.contains("signature") &&
         control.at("signature") == signature && control.contains("status") &&
         control.at("status") != "CONVERGED") {
         if (control.at("status") != "PUBLISHING") {
@@ -631,6 +974,7 @@ void SyncdService::reconcileDevice(
         device_db_.putHash(redis::syncdReconciliationKey(info.name), control);
     }
 
+    associatePortFaults(info, command_id);
     batch.options.operation_id = command_id;
     publishReconciliationState(info, plan, command_id);
     const auto desired_version = std::stoull(control.at("desired_version"));
@@ -1093,6 +1437,15 @@ void SyncdService::markProcessed(
                 {{"command_id", command_event.event_id}},
                 redis::deviceCountersKey(command_event.device),
                 {{"reconciliation_success_total", 1}}));
+            for (auto& [key, fault] : portFaults(command_event.device)) {
+                if (!fault.contains("command_id") ||
+                    fault.at("command_id") != command_event.event_id) {
+                    continue;
+                }
+                fault["status"] = "RECOVERED";
+                fault["recovered_at_ns"] = std::to_string(timestampNowNs());
+                hashes.emplace_back(key, std::move(fault));
+            }
         }
     }
     device_db_.putHashesAtomically(hashes);

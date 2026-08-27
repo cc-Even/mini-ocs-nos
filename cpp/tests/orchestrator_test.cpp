@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <algorithm>
 #include <csignal>
 #include <condition_variable>
 #include <cstdlib>
@@ -547,6 +548,130 @@ TEST_F(OrchestratorIntegrationTest, ReconciliationRecoversSameVersionFailedAppli
             ->getHash(ocs::redis::activeAlarmKey(
                 "ocs0", ocs::redis::desiredActualDriftAlarmId()))
             .empty());
+}
+
+TEST_F(OrchestratorIntegrationTest, PortDownPublishesStateAndAlarmThenReconcilesAfterClear) {
+    config_db_->putHash(
+        ocs::redis::connectionConfigKey("ocs0", "port-fault"),
+        {
+            {"device", "ocs0"},
+            {"id", "port-fault"},
+            {"input_port", "3"},
+            {"output_port", "11"},
+            {"desired_version", "1"},
+        });
+    applyConfigEvent({
+        .event_schema_version = 1,
+        .event_id = "event-port-fault",
+        .request_id = "request-port-fault",
+        .timestamp_ns = 1780000000000000073ULL,
+        .device = "ocs0",
+        .resource_type = "connection",
+        .resource_id = "port-fault",
+        .operation = "UPSERT",
+        .desired_version = 1,
+        .payload = R"({"input_port":3,"output_port":11})",
+    });
+    ASSERT_TRUE(syncd_->pollDevice());
+
+    const std::string state_group = "port-fault-state-events";
+    const std::string alarm_group = "port-fault-alarm-events";
+    state_db_->createConsumerGroup(std::string(ocs::redis::kStateEvents), state_group, "$");
+    alarm_db_->createConsumerGroup(std::string(ocs::redis::kAlarmEvents), alarm_group, "$");
+
+    const auto run_fault = [this, &state_group, &alarm_group](
+                               ocs::FaultType type,
+                               std::string_view direction,
+                               ocs::PortId port_id,
+                               std::string_view suffix) {
+        {
+            ocs::UdsDeviceBackend fault_backend(hwsim_socket_);
+            ASSERT_TRUE(fault_backend.injectFault({.type = type, .port_id = port_id}).error.ok());
+        }
+        ASSERT_TRUE(syncd_->pollDevice());
+
+        const auto port_id_text = std::to_string(port_id);
+        const auto port_key = direction == "input"
+                                  ? ocs::redis::inputPortStateKey("ocs0", port_id_text)
+                                  : ocs::redis::outputPortStateKey("ocs0", port_id_text);
+        EXPECT_EQ(state_db_->getHash(port_key).at("oper_status"), "DOWN");
+        const auto reconciling =
+            state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "port-fault"));
+        EXPECT_EQ(reconciling.at("apply_status"), "RECONCILING");
+        EXPECT_EQ(reconciling.at("actual_present"), "false");
+
+        const auto alarm_id = ocs::redis::portDownAlarmId(direction, port_id_text);
+        const auto alarm = alarm_db_->getHash(ocs::redis::activeAlarmKey("ocs0", alarm_id));
+        EXPECT_EQ(alarm.at("active"), "true");
+        EXPECT_EQ(alarm.at("affected_connection_count"), "1");
+        EXPECT_EQ(alarm.at("error_code"), "OCS_PORT_DOWN");
+
+        const auto down_events = state_db_->readGroup(
+            std::string(ocs::redis::kStateEvents),
+            state_group,
+            "port-fault-state-reader-" + std::string(suffix),
+            10);
+        EXPECT_TRUE(std::ranges::any_of(down_events, [&](const auto& message) {
+            return message.event.resource_type == std::string(direction) + "-port" &&
+                   message.event.resource_id == port_id_text &&
+                   message.event.payload.find("\"oper_status\":\"DOWN\"") !=
+                       std::string::npos;
+        }));
+        const auto raised = alarm_db_->readGroup(
+            std::string(ocs::redis::kAlarmEvents),
+            alarm_group,
+            "port-fault-alarm-reader-" + std::string(suffix),
+            10);
+        EXPECT_TRUE(std::ranges::any_of(raised, [&](const auto& message) {
+            return message.event.resource_id == alarm_id && message.event.operation == "UPSERT";
+        }));
+
+        const auto failed_command =
+            device_db_->getHash(ocs::redis::syncdReconciliationKey("ocs0")).at("command_id");
+        ASSERT_TRUE(syncd_->processOne("syncd-port-fault-" + std::string(suffix)));
+        ASSERT_TRUE(orch_->processResultOne("orch-port-fault-" + std::string(suffix)));
+        const auto failed =
+            state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "port-fault"));
+        EXPECT_EQ(failed.at("apply_status"), "FAILED");
+        EXPECT_EQ(failed.at("last_error_code"), "OCS_PORT_DOWN");
+        EXPECT_EQ(
+            device_db_->getHash(ocs::redis::processedDeviceCommandKey(failed_command))
+                .at("applied"),
+            "false");
+
+        {
+            ocs::UdsDeviceBackend fault_backend(hwsim_socket_);
+            ASSERT_TRUE(fault_backend.clearFault({.type = type, .port_id = port_id}).error.ok());
+        }
+        ASSERT_TRUE(syncd_->pollDevice());
+        EXPECT_EQ(state_db_->getHash(port_key).at("oper_status"), "UP");
+        EXPECT_TRUE(alarm_db_->getHash(ocs::redis::activeAlarmKey("ocs0", alarm_id)).empty());
+        const auto recovery_command =
+            device_db_->getHash(ocs::redis::syncdReconciliationKey("ocs0")).at("command_id");
+        EXPECT_NE(recovery_command, failed_command);
+        ASSERT_TRUE(syncd_->processOne("syncd-port-recovery-" + std::string(suffix)));
+        ASSERT_TRUE(orch_->processResultOne("orch-port-recovery-" + std::string(suffix)));
+        ASSERT_TRUE(syncd_->pollDevice());
+
+        const auto active =
+            state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "port-fault"));
+        EXPECT_EQ(active.at("apply_status"), "ACTIVE");
+        EXPECT_EQ(active.at("actual_present"), "true");
+        EXPECT_EQ(active.at("desired_version"), active.at("applied_version"));
+        EXPECT_EQ(
+            device_db_->getHash(ocs::redis::syncdReconciliationKey("ocs0")).at("status"),
+            "CONVERGED");
+    };
+
+    run_fault(ocs::FaultType::kInputPortDown, "input", 3, "input");
+    run_fault(ocs::FaultType::kOutputPortDown, "output", 11, "output");
+
+    const auto counters = counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"));
+    EXPECT_EQ(counters.at("active_connections"), "1");
+    EXPECT_EQ(counters.at("active_alarms"), "0");
+    EXPECT_EQ(counters.at("port_down_total"), "2");
+    EXPECT_EQ(counters.at("reconciliation_total"), "4");
+    EXPECT_EQ(counters.at("reconciliation_success_total"), "2");
 }
 
 TEST_F(OrchestratorIntegrationTest, ApplyTimeoutRaisesAlarmAndRecoversAfterDurableRetry) {

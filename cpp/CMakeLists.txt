@@ -96,6 +96,14 @@ target_compile_options(
         $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>
 )
 
+add_executable(ocs-hwsimctl ocs-hwsimctl/main.cpp)
+target_link_libraries(ocs-hwsimctl PRIVATE ocs::core)
+target_compile_options(
+    ocs-hwsimctl
+    PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>
+)
+
 add_executable(ocs-orch ocs-orch/main.cpp)
 target_link_libraries(ocs-orch PRIVATE ocs::core)
 target_compile_options(

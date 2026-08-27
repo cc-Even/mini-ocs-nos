@@ -137,6 +137,42 @@ inline constexpr std::string_view kFaultCommands = "OCS_FAULT_COMMANDS";
            std::string(device) + "|" + std::string(activation_id);
 }
 
+[[nodiscard]] inline std::string syncdPortFaultKey(
+    std::string_view device,
+    std::string_view direction,
+    std::string_view port_id) {
+    return "OCS_SYNCD_PORT_FAULT|" + std::string(device) + "|" +
+           std::string(direction) + "|" + std::string(port_id);
+}
+
+[[nodiscard]] inline std::string syncdPortFaultPattern(std::string_view device) {
+    return "OCS_SYNCD_PORT_FAULT|" + std::string(device) + "|*";
+}
+
+[[nodiscard]] inline std::string portDownAlarmId(
+    std::string_view direction,
+    std::string_view port_id) {
+    return "port-down-" + std::string(direction) + "-" + std::string(port_id);
+}
+
+[[nodiscard]] inline std::string syncdPortAlarmPublicationKey(
+    std::string_view activation_id) {
+    return "OCS_SYNCD_PORT_ALARM_PUBLISHED|" + std::string(activation_id);
+}
+
+[[nodiscard]] inline std::string syncdPortAlarmClearPublicationKey(
+    std::string_view activation_id) {
+    return "OCS_SYNCD_PORT_ALARM_CLEARED|" + std::string(activation_id);
+}
+
+[[nodiscard]] inline std::string syncdPortAlarmCounterPublicationKey(
+    std::string_view activation_id,
+    bool clear) {
+    return "OCS_SYNCD_PORT_ALARM_COUNTER_" +
+           std::string(clear ? "CLEARED|" : "RAISED|") +
+           std::string(activation_id);
+}
+
 [[nodiscard]] inline std::string processedDeviceCommandKey(std::string_view command_id) {
     return "OCS_PROCESSED_DEVICE_COMMAND|" + std::string(command_id);
 }

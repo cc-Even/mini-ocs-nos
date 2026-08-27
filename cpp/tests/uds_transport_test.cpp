@@ -79,6 +79,22 @@ TEST_F(UdsTransportTest, HandshakeAndDeviceInfoExposeGeneration) {
     EXPECT_EQ(backend_->getHealth().status, ocs::DeviceOperStatus::kReady);
 }
 
+TEST_F(UdsTransportTest, ServesFaultControlWhileSyncdSessionRemainsConnected) {
+    ASSERT_EQ(backend_->getDeviceInfo().name, "ocs0");
+    ocs::UdsDeviceBackend fault_control(socket_path_);
+
+    ASSERT_TRUE(
+        fault_control
+            .injectFault({.type = ocs::FaultType::kInputPortDown, .port_id = 3})
+            .error.ok());
+    EXPECT_EQ(backend_->getInputPortState(3).oper_status, ocs::PortOperStatus::kDown);
+    ASSERT_TRUE(
+        fault_control
+            .clearFault({.type = ocs::FaultType::kInputPortDown, .port_id = 3})
+            .error.ok());
+    EXPECT_EQ(backend_->getInputPortState(3).oper_status, ocs::PortOperStatus::kUp);
+}
+
 TEST_F(UdsTransportTest, AppliesQueriesAndRemovesConnection) {
     const ocs::ConnectionCommand create{
         .id = "conn-001",

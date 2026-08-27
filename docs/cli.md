@@ -60,6 +60,22 @@ ON_CHANGE values, and delete notifications. The client cancels the RPC and the
 server releases its per-subscription tasks when the duration expires or the
 user interrupts it.
 
+## Simulator-only port fault control
+
+`ocs-hwsimctl` is an internal test harness, not an operator management API. It
+talks directly to standalone hwsim over UDS and only supports deterministic
+input/output port faults:
+
+```bash
+ocs-hwsimctl /tmp/mini-ocs/ocs-hwsim.sock inject INPUT_PORT_DOWN 3
+ocs-hwsimctl /tmp/mini-ocs/ocs-hwsim.sock clear INPUT_PORT_DOWN 3
+ocs-hwsimctl /tmp/mini-ocs/ocs-hwsim.sock inject OUTPUT_PORT_DOWN 11
+ocs-hwsimctl /tmp/mini-ocs/ocs-hwsim.sock clear OUTPUT_PORT_DOWN 11
+```
+
+Production management remains gNMI-only. The helper exists so reliability
+tests can alter simulator state without writing production-path Redis data.
+
 ## Phase 3 acceptance
 
 `make redis-integration-test` launches standalone hwsim, orch, syncd, and gNMI
@@ -68,3 +84,6 @@ creates 1→9, 2→10, and 3→11, verifies all are ACTIVE with matching version
 `active-connections=3`, then exercises watch, replace, and delete. Scenario B
 submits a conflicting batch and verifies through gNMI that configuration,
 operational state, and counters remain unchanged.
+Scenario H injects an input-port fault through `ocs-hwsimctl`, verifies gNMI
+Subscribe reports DOWN and UP, observes the related connection and alarm, then
+waits for same-version full-snapshot recovery and zero active alarms.

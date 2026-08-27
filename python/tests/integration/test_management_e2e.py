@@ -70,7 +70,7 @@ async def _run_cli(target: str, *arguments: str) -> tuple[int, str, str]:
     return process.returncode, stdout.decode(), stderr.decode()
 
 
-async def test_scenarios_a_and_b_through_ocsctl_and_gnmi(tmp_path: Path) -> None:
+async def test_scenarios_a_b_and_h_through_ocsctl_and_gnmi(tmp_path: Path) -> None:
     redis_socket = os.environ["OCS_REDIS_SOCKET"]
     settings = RedisSettings(unix_socket=redis_socket)
     cleanup_clients = [create_redis_client(settings, database) for database in (0, 1, 2, 4, 6, 8)]
@@ -152,6 +152,71 @@ async def test_scenarios_a_and_b_through_ocsctl_and_gnmi(tmp_path: Path) -> None
             )
             counters = await client.get("/ocs/devices/device[name=ocs0]/counters")
             assert counters["active-connections"] == 3
+
+        port_path = "/ocs/devices/device[name=ocs0]/ports/input-port[id=3]/state"
+        alarm_path = (
+            "/ocs/devices/device[name=ocs0]/alarms/"
+            "alarm[id=port-down-input-3]"
+        )
+        async with GnmiClient(target, timeout_seconds=8.0) as client:
+            notifications = client.subscribe(port_path)
+            initial_port = await anext(notifications)
+            assert initial_port["value"]["oper-status"] == "UP"
+            assert await anext(notifications) == {"sync-response": True}
+
+            fault = await asyncio.create_subprocess_exec(
+                executable_root / "ocs-hwsimctl",
+                hwsim_socket,
+                "inject",
+                "INPUT_PORT_DOWN",
+                "3",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            fault_stdout, fault_stderr = await fault.communicate()
+            assert fault.returncode == 0, (fault_stdout + fault_stderr).decode()
+            down = await asyncio.wait_for(anext(notifications), timeout=5.0)
+            assert down["value"]["oper-status"] == "DOWN"
+
+            failed = await client.wait_for_connection(
+                "ocs0", "conn-3", apply_status="FAILED"
+            )
+            assert failed["last-error-code"] == "OCS_PORT_DOWN"
+            alarm = await client.get(alarm_path)
+            assert alarm["active"] is True
+            assert alarm["affected-connection-count"] == 1
+
+            clear = await asyncio.create_subprocess_exec(
+                executable_root / "ocs-hwsimctl",
+                hwsim_socket,
+                "clear",
+                "INPUT_PORT_DOWN",
+                "3",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            clear_stdout, clear_stderr = await clear.communicate()
+            assert clear.returncode == 0, (clear_stdout + clear_stderr).decode()
+            up = await asyncio.wait_for(anext(notifications), timeout=5.0)
+            assert up["value"]["oper-status"] == "UP"
+            await notifications.aclose()
+
+            recovered = await client.wait_for_connection("ocs0", "conn-3")
+            assert recovered["desired-version"] == recovered["applied-version"] == 1
+            with pytest.raises(grpc.aio.AioRpcError) as cleared_alarm:
+                await client.get(alarm_path)
+            assert cleared_alarm.value.code() is grpc.StatusCode.NOT_FOUND
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while True:
+                counters = await client.get("/ocs/devices/device[name=ocs0]/counters")
+                if counters["active-alarms"] == 0:
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("port and drift alarms did not fully clear")
+                await asyncio.sleep(0.05)
+            assert counters["active-connections"] == 3
+            assert counters["active-alarms"] == 0
+            assert counters["port-down-total"] == 1
 
         code, _, stderr = await _run_cli(
             target,
