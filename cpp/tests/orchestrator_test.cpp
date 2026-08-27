@@ -237,6 +237,15 @@ TEST_F(OrchestratorIntegrationTest, RecoversConfirmedStateAfterStandaloneHwsimRe
         .desired_version = 1,
         .payload = R"({"input_port":3,"output_port":11})",
     };
+    config_db_->putHash(
+        ocs::redis::connectionConfigKey("ocs0", "conn-hwsim-restart"),
+        {
+            {"device", "ocs0"},
+            {"id", "conn-hwsim-restart"},
+            {"input_port", "3"},
+            {"output_port", "11"},
+            {"desired_version", "1"},
+        });
     applyConfigEvent(create);
     const auto first_device_state =
         state_db_->getHash(ocs::redis::deviceStateKey("ocs0"));
@@ -260,6 +269,15 @@ TEST_F(OrchestratorIntegrationTest, RecoversConfirmedStateAfterStandaloneHwsimRe
         .desired_version = 2,
         .payload = R"({"input_port":4,"output_port":12})",
     };
+    config_db_->putHash(
+        ocs::redis::connectionConfigKey("ocs0", "conn-hwsim-restart"),
+        {
+            {"device", "ocs0"},
+            {"id", "conn-hwsim-restart"},
+            {"input_port", "4"},
+            {"output_port", "12"},
+            {"desired_version", "2"},
+        });
     static_cast<void>(config_db_->appendEvent(
         std::string(ocs::redis::kConfigEvents), update));
     ASSERT_TRUE(orch_->processConfigOne("orch-hwsim-down"));
@@ -334,6 +352,201 @@ TEST_F(OrchestratorIntegrationTest, RecoversConfirmedStateAfterStandaloneHwsimRe
     EXPECT_EQ(actual.front().input_port, 4);
     EXPECT_EQ(actual.front().output_port, 12);
     EXPECT_EQ(actual.front().applied_version, 2);
+}
+
+TEST_F(OrchestratorIntegrationTest, ReconcilesOutOfBandDriftWithFullDesiredSnapshot) {
+    const auto create = [this](
+                            std::string id,
+                            ocs::PortId input_port,
+                            ocs::PortId output_port,
+                            std::uint64_t timestamp) {
+        config_db_->putHash(
+            ocs::redis::connectionConfigKey("ocs0", id),
+            {
+                {"device", "ocs0"},
+                {"id", id},
+                {"input_port", std::to_string(input_port)},
+                {"output_port", std::to_string(output_port)},
+                {"desired_version", "1"},
+            });
+        applyConfigEvent({
+            .event_schema_version = 1,
+            .event_id = "event-drift-" + id,
+            .request_id = "request-drift-" + id,
+            .timestamp_ns = timestamp,
+            .device = "ocs0",
+            .resource_type = "connection",
+            .resource_id = id,
+            .operation = "UPSERT",
+            .desired_version = 1,
+            .payload = "{\"input_port\":" + std::to_string(input_port) +
+                       ",\"output_port\":" + std::to_string(output_port) + "}",
+        });
+    };
+    create("drift-a", 3, 11, 1780000000000000070ULL);
+    create("drift-b", 4, 12, 1780000000000000071ULL);
+    ASSERT_TRUE(syncd_->pollDevice());
+    EXPECT_EQ(
+        counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"))
+            .at("active_connections"),
+        "2");
+
+    const std::string state_group = "drift-state-events";
+    const std::string alarm_group = "drift-alarm-events";
+    state_db_->createConsumerGroup(std::string(ocs::redis::kStateEvents), state_group, "$");
+    alarm_db_->createConsumerGroup(std::string(ocs::redis::kAlarmEvents), alarm_group, "$");
+
+    syncd_.reset();
+    {
+        ocs::UdsDeviceBackend fault_backend(hwsim_socket_);
+        ASSERT_TRUE(
+            fault_backend.injectFault({.type = ocs::FaultType::kOutOfBandDrift}).error.ok());
+        ASSERT_EQ(fault_backend.getConnections().size(), 1);
+    }
+    syncd_ = std::make_unique<ocs::SyncdService>(
+        endpoint_, std::make_unique<ocs::UdsDeviceBackend>(hwsim_socket_));
+    syncd_->initialize();
+
+    ASSERT_TRUE(syncd_->pollDevice());
+    const auto control =
+        device_db_->getHash(ocs::redis::syncdReconciliationKey("ocs0"));
+    ASSERT_EQ(control.at("status"), "PUBLISHED");
+    const auto command_id = control.at("command_id");
+    const auto drifted =
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "drift-a"));
+    EXPECT_EQ(drifted.at("apply_status"), "RECONCILING");
+    EXPECT_EQ(drifted.at("actual_present"), "false");
+    EXPECT_EQ(drifted.at("applied_version"), "0");
+    const auto state_events = state_db_->readGroup(
+        std::string(ocs::redis::kStateEvents), state_group, "drift-state-reader", 10);
+    ASSERT_EQ(state_events.size(), 3);
+    EXPECT_NE(state_events.at(0).event.payload.find("\"apply_status\":\"DRIFTED\""),
+              std::string::npos);
+    EXPECT_NE(state_events.at(1).event.payload.find("\"apply_status\":\"RECONCILING\""),
+              std::string::npos);
+    EXPECT_EQ(state_events.at(2).event.resource_type, "device");
+
+    const auto alarm_key = ocs::redis::activeAlarmKey(
+        "ocs0", ocs::redis::desiredActualDriftAlarmId());
+    const auto alarm = alarm_db_->getHash(alarm_key);
+    EXPECT_EQ(alarm.at("active"), "true");
+    EXPECT_EQ(alarm.at("drift_count"), "1");
+    const auto raised = alarm_db_->readGroup(
+        std::string(ocs::redis::kAlarmEvents), alarm_group, "drift-alarm-reader");
+    ASSERT_EQ(raised.size(), 1);
+    EXPECT_EQ(raised.front().event.operation, "UPSERT");
+
+    const auto before = counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"));
+    EXPECT_EQ(before.at("active_connections"), "1");
+    EXPECT_EQ(before.at("active_alarms"), "1");
+    EXPECT_EQ(before.at("drift_detected_total"), "1");
+    EXPECT_EQ(before.at("reconciliation_total"), "1");
+
+    ASSERT_TRUE(syncd_->processOne("syncd-drift-reconcile"));
+    const auto attempt = device_db_->getHash(ocs::redis::deviceApplyAttemptKey(command_id));
+    const auto full_snapshot = ocs::decodeDeviceCommand(attempt.at("payload"));
+    ASSERT_EQ(full_snapshot.commands.size(), 2);
+    EXPECT_EQ(full_snapshot.commands.at(0).id, "drift-a");
+    EXPECT_EQ(full_snapshot.commands.at(1).id, "drift-b");
+    ASSERT_TRUE(orch_->processResultOne("orch-drift-result-a"));
+    ASSERT_TRUE(orch_->processResultOne("orch-drift-result-b"));
+    ASSERT_TRUE(syncd_->pollDevice());
+
+    EXPECT_EQ(
+        device_db_->getHash(ocs::redis::syncdReconciliationKey("ocs0")).at("status"),
+        "CONVERGED");
+    EXPECT_TRUE(alarm_db_->getHash(alarm_key).empty());
+    const auto cleared = alarm_db_->readGroup(
+        std::string(ocs::redis::kAlarmEvents), alarm_group, "drift-alarm-reader");
+    ASSERT_EQ(cleared.size(), 1);
+    EXPECT_EQ(cleared.front().event.operation, "REMOVE");
+    const auto counters = counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"));
+    EXPECT_EQ(counters.at("active_connections"), "2");
+    EXPECT_EQ(counters.at("active_alarms"), "0");
+    EXPECT_EQ(counters.at("drift_detected_total"), "1");
+    EXPECT_EQ(counters.at("reconciliation_total"), "1");
+    EXPECT_EQ(counters.at("reconciliation_success_total"), "1");
+    EXPECT_EQ(
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "drift-a"))
+            .at("apply_status"),
+        "ACTIVE");
+    EXPECT_EQ(
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "drift-b"))
+            .at("apply_status"),
+        "ACTIVE");
+
+    syncd_.reset();
+    ocs::UdsDeviceBackend verifier(hwsim_socket_);
+    const auto actual = verifier.getConnections();
+    ASSERT_EQ(actual.size(), 2);
+    EXPECT_EQ(actual.at(0).id, "drift-a");
+    EXPECT_EQ(actual.at(1).id, "drift-b");
+}
+
+TEST_F(OrchestratorIntegrationTest, ReconciliationRecoversSameVersionFailedApplication) {
+    syncd_.reset();
+    {
+        ocs::UdsDeviceBackend fault_backend(hwsim_socket_);
+        ASSERT_TRUE(
+            fault_backend.injectFault({.type = ocs::FaultType::kNextApplyError}).error.ok());
+    }
+    syncd_ = std::make_unique<ocs::SyncdService>(
+        endpoint_, std::make_unique<ocs::UdsDeviceBackend>(hwsim_socket_));
+    syncd_->initialize();
+
+    config_db_->putHash(
+        ocs::redis::connectionConfigKey("ocs0", "reconcile-failed"),
+        {
+            {"device", "ocs0"},
+            {"id", "reconcile-failed"},
+            {"input_port", "6"},
+            {"output_port", "14"},
+            {"desired_version", "1"},
+        });
+    const ocs::redis::EventEnvelope create{
+        .event_schema_version = 1,
+        .event_id = "event-reconcile-failed",
+        .request_id = "request-reconcile-failed",
+        .timestamp_ns = 1780000000000000072ULL,
+        .device = "ocs0",
+        .resource_type = "connection",
+        .resource_id = "reconcile-failed",
+        .operation = "UPSERT",
+        .desired_version = 1,
+        .payload = R"({"input_port":6,"output_port":14})",
+    };
+    static_cast<void>(config_db_->appendEvent(
+        std::string(ocs::redis::kConfigEvents), create));
+    ASSERT_TRUE(orch_->processConfigOne("orch-reconcile-failed"));
+    ASSERT_TRUE(syncd_->processOne("syncd-reconcile-failed"));
+    ASSERT_TRUE(orch_->processResultOne("orch-reconcile-failed-result"));
+    EXPECT_EQ(
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "reconcile-failed"))
+            .at("apply_status"),
+        "FAILED");
+
+    ASSERT_TRUE(syncd_->pollDevice());
+    EXPECT_EQ(
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "reconcile-failed"))
+            .at("apply_status"),
+        "FAILED");
+    ASSERT_TRUE(syncd_->processOne("syncd-reconcile-failed-recovery"));
+    ASSERT_TRUE(orch_->processResultOne("orch-reconcile-failed-recovery-result"));
+    ASSERT_TRUE(syncd_->pollDevice());
+
+    EXPECT_EQ(
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "reconcile-failed"))
+            .at("apply_status"),
+        "ACTIVE");
+    EXPECT_EQ(
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "reconcile-failed"))
+            .at("apply_status"),
+        "ACTIVE");
+    EXPECT_TRUE(
+        alarm_db_
+            ->getHash(ocs::redis::activeAlarmKey(
+                "ocs0", ocs::redis::desiredActualDriftAlarmId()))
+            .empty());
 }
 
 TEST_F(OrchestratorIntegrationTest, ApplyTimeoutRaisesAlarmAndRecoversAfterDurableRetry) {

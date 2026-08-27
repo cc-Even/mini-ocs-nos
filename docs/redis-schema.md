@@ -217,6 +217,26 @@ cannot suppress necessary work on its replacement. Recovery results may move
 same-version failed application state through the existing retry transition
 path back to `ACTIVE` (or `ABSENT` for a remove).
 
+After orchestration has reached a terminal snapshot for the complete desired
+configuration, the same 250 millisecond device poll compares CONFIG_DB intent
+with the confirmed matrix returned by standalone hwsim. A mismatch publishes
+`DRIFTED` and `RECONCILING` state events, raises the device-level
+`desired-actual-drift` alarm, and appends one atomic `RECONCILE` command. The
+command contains every desired UPSERT plus REMOVE operations for unexpected
+actual connections; it never repairs only the observed delta. Normal
+configuration work and generation recovery take precedence so reconciliation
+cannot race an in-flight create, update, delete, or simulator restart.
+
+`OCS_SYNCD_RECONCILIATION|device` records the durable reconciliation cycle and
+its full-snapshot signature. Per-state, command, alarm, counter, and success
+publication markers make a crash at any boundary resumable without duplicate
+events or counter increments. Detection increments `drift_detected_total` and
+`reconciliation_total`; a confirmed successful device apply increments
+`reconciliation_success_total`. Convergence clears the alarm and returns the
+control record to `CONVERGED`. The simulator-only `OUT_OF_BAND_DRIFT` fault
+removes a deterministic actual connection without changing its version fence,
+providing the supported scenario-G test path without manipulating Redis.
+
 Each syncd loop first performs a bounded XPENDING scan and XCLAIM for commands
 whose idle time exceeds `OCS_SYNCD_PENDING_MIN_IDLE_MS` (five seconds by
 default), then reads a new command. The claim threshold is configurable for

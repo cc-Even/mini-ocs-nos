@@ -126,6 +126,16 @@ TEST_F(UdsTransportTest, FaultAndResetCallsCrossSocketBoundary) {
             .error.ok());
     EXPECT_EQ(backend_->getInputPortState(4).oper_status, ocs::PortOperStatus::kUp);
 
+    ASSERT_TRUE(
+        backend_
+            ->applyConnections(
+                {{.id = "drifted", .input_port = 5, .output_port = 13, .desired_version = 2}},
+                {})
+            .ok());
+    ASSERT_TRUE(
+        backend_->injectFault({.type = ocs::FaultType::kOutOfBandDrift}).error.ok());
+    EXPECT_TRUE(backend_->getConnections().empty());
+
     const auto reset = backend_->reset(ocs::ResetMode::kHard);
     EXPECT_TRUE(reset.error.ok());
     EXPECT_EQ(reset.generation, 2);

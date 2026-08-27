@@ -1,5 +1,6 @@
 #include "ocs/syncd_service.hpp"
 
+#include "ocs/connection_state_machine.hpp"
 #include "ocs/device_command.hpp"
 #include "ocs/redis_keys.hpp"
 
@@ -113,6 +114,10 @@ bool isGenerationRecovery(std::string_view command_id) {
     return command_id.starts_with("hwsim-recovery:");
 }
 
+bool isReconciliation(std::string_view command_id) {
+    return command_id.starts_with("reconcile:");
+}
+
 }  // namespace
 
 SyncdService::SyncdService(
@@ -122,7 +127,8 @@ SyncdService::SyncdService(
     : device_db_(endpoint, redis::LogicalDb::kDevice),
       state_db_(endpoint, redis::LogicalDb::kState),
       counters_db_(endpoint, redis::LogicalDb::kCounters),
-      config_db_(std::move(endpoint), redis::LogicalDb::kConfig),
+      config_db_(endpoint, redis::LogicalDb::kConfig),
+      alarm_db_(std::move(endpoint), redis::LogicalDb::kAlarm),
       device_(std::move(device)),
       pending_min_idle_(pending_min_idle) {
     if (!device_) {
@@ -202,6 +208,20 @@ bool SyncdService::pollDevice() {
         device_generation_ = info.generation;
         if (generation_changed) {
             scheduleGenerationRecovery(info, actual);
+        } else {
+            const auto generation_recovery = device_db_.getHash(
+                redis::syncdGenerationRecoveryKey(info.name, info.generation));
+            const bool recovery_pending =
+                generation_recovery.contains("recovery_required") &&
+                generation_recovery.at("recovery_required") == "true" &&
+                generation_recovery.contains("command_id") &&
+                device_db_
+                    .getHash(redis::processedDeviceCommandKey(
+                        generation_recovery.at("command_id")))
+                    .empty();
+            if (!recovery_pending) {
+                reconcileDevice(info, actual);
+            }
         }
         if (generation_changed || actual_count_changed || status == state.end() ||
             status->second != "READY") {
@@ -496,6 +516,379 @@ void SyncdService::scheduleGenerationRecovery(
         event));
 }
 
+std::vector<ConnectionCommand> SyncdService::loadDesiredConnections(std::string_view device) {
+    std::vector<ConnectionCommand> desired;
+    const auto keys = config_db_.scanKeys(redis::connectionConfigPattern(device));
+    desired.reserve(keys.size());
+    for (const auto& key : keys) {
+        const auto snapshot = config_db_.getHash(key);
+        if (snapshot.empty()) {
+            continue;
+        }
+        const auto separator = key.rfind('|');
+        const auto id = snapshot.contains("id")
+                            ? snapshot.at("id")
+                            : key.substr(separator == std::string::npos ? 0 : separator + 1);
+        if (id.empty() || !snapshot.contains("desired_version")) {
+            throw std::invalid_argument("desired connection snapshot is missing identity or version");
+        }
+        desired.push_back({
+            .id = id,
+            .input_port = snapshotPort(snapshot, "input_port"),
+            .output_port = snapshotPort(snapshot, "output_port"),
+            .desired_version = std::stoull(snapshot.at("desired_version")),
+        });
+    }
+    return desired;
+}
+
+bool SyncdService::orchestrationSettled(
+    std::string_view device,
+    const std::vector<ConnectionCommand>& desired) {
+    std::unordered_map<std::string, ConnectionCommand> desired_by_id;
+    for (const auto& command : desired) {
+        desired_by_id.emplace(command.id, command);
+    }
+    const auto keys = device_db_.scanKeys(redis::connectionDevicePattern(device));
+    for (const auto& key : keys) {
+        const auto snapshot = device_db_.getHash(key);
+        if (snapshot.empty() || !snapshot.contains("id") ||
+            !snapshot.contains("desired_version") || !snapshot.contains("apply_status")) {
+            return false;
+        }
+        const auto desired_item = desired_by_id.find(snapshot.at("id"));
+        if (desired_item == desired_by_id.end()) {
+            const auto operation = snapshot.find("operation");
+            if (operation == snapshot.end() || operation->second != "REMOVE" ||
+                snapshot.at("apply_status") != "FAILED") {
+                return false;
+            }
+            continue;
+        }
+        const auto& command = desired_item->second;
+        const auto status = snapshot.at("apply_status");
+        if ((status != "ACTIVE" && status != "FAILED") ||
+            std::stoull(snapshot.at("desired_version")) != command.desired_version ||
+            snapshotPort(snapshot, "input_port") != command.input_port ||
+            snapshotPort(snapshot, "output_port") != command.output_port) {
+            return false;
+        }
+        desired_by_id.erase(desired_item);
+    }
+    return desired_by_id.empty();
+}
+
+void SyncdService::reconcileDevice(
+    const DeviceInfo& info,
+    const std::vector<AppliedConnection>& actual) {
+    const auto desired = loadDesiredConnections(info.name);
+    if (!orchestrationSettled(info.name, desired)) {
+        return;
+    }
+    auto plan = buildReconciliationPlan(desired, actual);
+    auto control = device_db_.getHash(redis::syncdReconciliationKey(info.name));
+    if (plan.converged()) {
+        if (!control.empty() && control.find("status") != control.end() &&
+            control.at("status") != "CONVERGED") {
+            const auto command_id = control.at("command_id");
+            const auto desired_version = control.contains("desired_version")
+                                             ? std::stoull(control.at("desired_version"))
+                                             : 0;
+            clearDriftAlarm(info, command_id, desired_version);
+            control["status"] = "CONVERGED";
+            control["converged_at_ns"] = std::to_string(timestampNowNs());
+            device_db_.putHash(redis::syncdReconciliationKey(info.name), control);
+        }
+        return;
+    }
+
+    auto batch = plan.full_snapshot;
+    const auto signature = encodeDeviceCommand(batch);
+    std::string command_id;
+    if (!control.empty() && control.contains("signature") &&
+        control.at("signature") == signature && control.contains("status") &&
+        control.at("status") != "CONVERGED") {
+        if (control.at("status") != "PUBLISHING") {
+            return;
+        }
+        command_id = control.at("command_id");
+    } else {
+        command_id = "reconcile:" + info.name + ":" + std::to_string(timestampNowNs()) +
+                     ":command";
+        std::uint64_t desired_version = 1;
+        for (const auto& command : batch.commands) {
+            desired_version = std::max(desired_version, command.desired_version);
+        }
+        control = {
+            {"device", info.name},
+            {"device_generation", std::to_string(info.generation)},
+            {"command_id", command_id},
+            {"desired_version", std::to_string(desired_version)},
+            {"signature", signature},
+            {"status", "PUBLISHING"},
+            {"started_at_ns", std::to_string(timestampNowNs())},
+        };
+        device_db_.putHash(redis::syncdReconciliationKey(info.name), control);
+    }
+
+    batch.options.operation_id = command_id;
+    publishReconciliationState(info, plan, command_id);
+    const auto desired_version = std::stoull(control.at("desired_version"));
+    publishDriftAlarm(info, command_id, desired_version, plan.drifts.size());
+    const auto payload = encodeDeviceCommand(batch);
+    constexpr std::string_view suffix = ":command";
+    const auto prepared_id = command_id.substr(0, command_id.size() - suffix.size());
+    device_db_.putHash(
+        redis::orchConfigBatchKey(prepared_id),
+        {
+            {"payload", payload},
+            {"device_generation", std::to_string(info.generation)},
+        });
+    const redis::EventEnvelope event{
+        .event_schema_version = 1,
+        .event_id = command_id,
+        .request_id = prepared_id,
+        .timestamp_ns = timestampNowNs(),
+        .device = info.name,
+        .resource_type = batch.commands.size() == 1 ? "connection" : "connection-batch",
+        .resource_id = batch.commands.size() == 1 ? batch.commands.front().id : info.name,
+        .operation = "RECONCILE",
+        .desired_version = desired_version,
+        .payload = payload,
+    };
+    static_cast<void>(device_db_.appendEventOnce(
+        redis::syncdReconciliationCommandPublicationKey(command_id),
+        {
+            {"command_id", command_id},
+            {"device_generation", std::to_string(info.generation)},
+            {"desired_version", std::to_string(desired_version)},
+        },
+        std::string(redis::kDeviceCommands),
+        event));
+    control["status"] = "PUBLISHED";
+    control["published_at_ns"] = std::to_string(timestampNowNs());
+    device_db_.putHash(redis::syncdReconciliationKey(info.name), control);
+}
+
+void SyncdService::publishReconciliationState(
+    const DeviceInfo& info,
+    const ReconciliationPlan& plan,
+    std::string_view command_id) {
+    long long active_delta = 0;
+    for (const auto& drift : plan.drifts) {
+        const auto state_key = redis::connectionStateKey(info.name, drift.id);
+        const auto previous = state_db_.getHash(state_key);
+        if (previous.contains("apply_status") &&
+            (previous.at("apply_status") == "FAILED" ||
+             previous.at("apply_status") == "RETRY_WAIT")) {
+            continue;
+        }
+        const bool was_active = previous.contains("actual_present")
+                                    ? previous.at("actual_present") == "true"
+                                    : previous.contains("applied_version") &&
+                                          previous.at("applied_version") != "0";
+        const bool is_active = drift.kind != ConnectionDriftKind::kMissing;
+        std::map<std::string, std::string> drifted{
+            {"device", info.name},
+            {"id", drift.id},
+            {"input_port", std::to_string(is_active ? drift.actual.input_port
+                                                     : drift.desired.input_port)},
+            {"output_port", std::to_string(is_active ? drift.actual.output_port
+                                                      : drift.desired.output_port)},
+            {"desired_version", std::to_string(drift.desired.desired_version)},
+            {"applied_version", std::to_string(is_active ? drift.actual.applied_version : 0)},
+            {"actual_present", is_active ? "true" : "false"},
+            {"apply_status", "DRIFTED"},
+            {"last_error_code", std::string(toString(ErrorCode::kApplyFailed))},
+            {"last_error_message", "desired and actual connection state differ"},
+        };
+        if (!previous.empty() && previous.contains("apply_status") &&
+            previous.at("apply_status") == "ACTIVE") {
+            requireTransition(ConnectionApplyStatus::kActive, ConnectionApplyStatus::kDrifted);
+        }
+        const auto desired_version = drift.desired.desired_version;
+        const redis::EventEnvelope drift_event{
+            .event_schema_version = 1,
+            .event_id = std::string(command_id) + ":drifted:" + drift.id,
+            .request_id = std::string(command_id),
+            .timestamp_ns = timestampNowNs(),
+            .device = info.name,
+            .resource_type = "connection",
+            .resource_id = drift.id,
+            .operation = "UPSERT",
+            .desired_version = desired_version,
+            .payload = statePayload(drifted),
+        };
+        const auto drift_marker = redis::syncdReconciliationStatePublicationKey(
+            command_id, drift.id, "DRIFTED");
+        const auto delta = was_active == is_active ? 0 : (is_active ? 1 : -1);
+        const auto published = state_db_.replaceHashAndAppendEventOnce(
+            drift_marker,
+            {
+                {"command_id", std::string(command_id)},
+                {"connection_id", drift.id},
+                {"active_delta", std::to_string(delta)},
+            },
+            state_key,
+            drifted,
+            std::string(redis::kStateEvents),
+            drift_event);
+        active_delta += published
+                            ? delta
+                            : std::stoll(state_db_.getHash(drift_marker).at("active_delta"));
+
+        requireTransition(ConnectionApplyStatus::kDrifted, ConnectionApplyStatus::kReconciling);
+        auto reconciling = drifted;
+        reconciling["apply_status"] = "RECONCILING";
+        const redis::EventEnvelope reconciling_event{
+            .event_schema_version = 1,
+            .event_id = std::string(command_id) + ":reconciling:" + drift.id,
+            .request_id = std::string(command_id),
+            .timestamp_ns = timestampNowNs(),
+            .device = info.name,
+            .resource_type = "connection",
+            .resource_id = drift.id,
+            .operation = "UPSERT",
+            .desired_version = desired_version,
+            .payload = statePayload(reconciling),
+        };
+        static_cast<void>(state_db_.replaceHashAndAppendEventOnce(
+            redis::syncdReconciliationStatePublicationKey(
+                command_id, drift.id, "RECONCILING"),
+            {{"command_id", std::string(command_id)}, {"connection_id", drift.id}},
+            state_key,
+            reconciling,
+            std::string(redis::kStateEvents),
+            reconciling_event));
+    }
+    static_cast<void>(counters_db_.incrementHashFieldsOnce(
+        redis::syncdReconciliationCountersPublicationKey(command_id),
+        {{"command_id", std::string(command_id)}},
+        redis::deviceCountersKey(info.name),
+        {
+            {"active_connections", active_delta},
+            {"drift_detected_total", 1},
+            {"reconciliation_total", 1},
+        }));
+}
+
+void SyncdService::publishDriftAlarm(
+    const DeviceInfo& info,
+    std::string_view command_id,
+    std::uint64_t desired_version,
+    std::size_t drift_count) {
+    const auto alarm_id = redis::desiredActualDriftAlarmId();
+    const auto alarm_key = redis::activeAlarmKey(info.name, alarm_id);
+    const auto marker_key = redis::syncdDriftAlarmPublicationKey(command_id);
+    auto marker = alarm_db_.getHash(marker_key);
+    if (marker.empty()) {
+        const auto active = alarm_db_.getHash(alarm_key);
+        const auto now = timestampNowNs();
+        const auto activation_id = active.contains("activation_id")
+                                       ? active.at("activation_id")
+                                       : std::string(command_id);
+        const std::map<std::string, std::string> fields{
+            {"id", alarm_id},
+            {"active", "true"},
+            {"severity", "MAJOR"},
+            {"resource_type", "device"},
+            {"resource_id", info.name},
+            {"desired_version", std::to_string(desired_version)},
+            {"error_code", std::string(toString(ErrorCode::kApplyFailed))},
+            {"error_message", "desired and actual connection matrices differ"},
+            {"drift_count", std::to_string(drift_count)},
+            {"activation_id", activation_id},
+            {"first_raised_ns", active.contains("first_raised_ns")
+                                    ? active.at("first_raised_ns")
+                                    : std::to_string(now)},
+            {"last_change_ns", std::to_string(now)},
+        };
+        marker = {
+            {"command_id", std::string(command_id)},
+            {"activation_id", activation_id},
+            {"activated", active.empty() ? "true" : "false"},
+        };
+        const redis::EventEnvelope event{
+            .event_schema_version = 1,
+            .event_id = std::string(command_id) + ":alarm",
+            .request_id = std::string(command_id),
+            .timestamp_ns = now,
+            .device = info.name,
+            .resource_type = "alarm",
+            .resource_id = alarm_id,
+            .operation = "UPSERT",
+            .desired_version = desired_version,
+            .payload = statePayload(fields),
+        };
+        static_cast<void>(alarm_db_.replaceHashAndAppendEventOnce(
+            marker_key,
+            marker,
+            alarm_key,
+            fields,
+            std::string(redis::kAlarmEvents),
+            event));
+        marker = alarm_db_.getHash(marker_key);
+    }
+    if (marker.at("activated") == "true") {
+        static_cast<void>(counters_db_.incrementHashFieldsOnce(
+            redis::syncdDriftAlarmCounterPublicationKey(
+                info.name, marker.at("activation_id"), false),
+            {{"activation_id", marker.at("activation_id")}},
+            redis::deviceCountersKey(info.name),
+            {{"active_alarms", 1}}));
+    }
+}
+
+void SyncdService::clearDriftAlarm(
+    const DeviceInfo& info,
+    std::string_view command_id,
+    std::uint64_t desired_version) {
+    const auto alarm_id = redis::desiredActualDriftAlarmId();
+    const auto alarm_key = redis::activeAlarmKey(info.name, alarm_id);
+    const auto marker_key = redis::syncdDriftAlarmClearPublicationKey(command_id);
+    auto marker = alarm_db_.getHash(marker_key);
+    auto active = alarm_db_.getHash(alarm_key);
+    if (marker.empty() && active.empty()) {
+        return;
+    }
+    if (marker.empty()) {
+        const auto now = timestampNowNs();
+        active["active"] = "false";
+        active["last_change_ns"] = std::to_string(now);
+        marker = {
+            {"command_id", std::string(command_id)},
+            {"activation_id", active.at("activation_id")},
+            {"cleared", "true"},
+        };
+        const redis::EventEnvelope event{
+            .event_schema_version = 1,
+            .event_id = std::string(command_id) + ":alarm-clear",
+            .request_id = std::string(command_id),
+            .timestamp_ns = now,
+            .device = info.name,
+            .resource_type = "alarm",
+            .resource_id = alarm_id,
+            .operation = "REMOVE",
+            .desired_version = desired_version,
+            .payload = statePayload(active),
+        };
+        static_cast<void>(alarm_db_.replaceHashAndAppendEventOnce(
+            marker_key,
+            marker,
+            alarm_key,
+            {},
+            std::string(redis::kAlarmEvents),
+            event));
+        marker = alarm_db_.getHash(marker_key);
+    }
+    static_cast<void>(counters_db_.incrementHashFieldsOnce(
+        redis::syncdDriftAlarmCounterPublicationKey(
+            info.name, marker.at("activation_id"), true),
+        {{"activation_id", marker.at("activation_id")}},
+        redis::deviceCountersKey(info.name),
+        {{"active_alarms", -1}}));
+}
+
 bool SyncdService::processOne(
     const std::string& consumer_name,
     const std::function<void()>& before_ack,
@@ -631,7 +1024,8 @@ bool SyncdService::isAlreadyProcessed(const redis::EventEnvelope& command_event)
 bool SyncdService::isStaleVersion(
     const redis::EventEnvelope& command_event,
     const DeviceCommandBatch& batch) {
-    if (isGenerationRecovery(command_event.event_id)) {
+    if (isGenerationRecovery(command_event.event_id) ||
+        isReconciliation(command_event.event_id)) {
         return false;
     }
     return std::ranges::all_of(batch.commands, [this, &command_event](const auto& command) {
@@ -683,6 +1077,22 @@ void SyncdService::markProcessed(
                                       ? "REMOVE"
                                       : "UPSERT"},
                 }});
+        }
+    }
+    if (isReconciliation(command_event.event_id)) {
+        auto control = device_db_.getHash(redis::syncdReconciliationKey(command_event.device));
+        if (!control.empty() && control.contains("command_id") &&
+            control.at("command_id") == command_event.event_id) {
+            control["status"] = applied ? "APPLIED" : "FAILED";
+            control["completed_at_ns"] = std::to_string(timestampNowNs());
+            hashes.push_back({redis::syncdReconciliationKey(command_event.device), control});
+        }
+        if (applied) {
+            static_cast<void>(counters_db_.incrementHashFieldsOnce(
+                redis::syncdReconciliationSuccessCountersPublicationKey(command_event.event_id),
+                {{"command_id", command_event.event_id}},
+                redis::deviceCountersKey(command_event.device),
+                {{"reconciliation_success_total", 1}}));
         }
     }
     device_db_.putHashesAtomically(hashes);

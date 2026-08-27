@@ -2,6 +2,7 @@
 
 #include "ocs/device_command.hpp"
 #include "ocs/device_api.hpp"
+#include "ocs/reconciler.hpp"
 #include "ocs/redis_repository.hpp"
 
 #include <chrono>
@@ -53,11 +54,33 @@ private:
     void scheduleGenerationRecovery(
         const DeviceInfo& info,
         const std::vector<AppliedConnection>& actual);
+    [[nodiscard]] std::vector<ConnectionCommand> loadDesiredConnections(
+        std::string_view device);
+    [[nodiscard]] bool orchestrationSettled(
+        std::string_view device,
+        const std::vector<ConnectionCommand>& desired);
+    void reconcileDevice(
+        const DeviceInfo& info,
+        const std::vector<AppliedConnection>& actual);
+    void publishReconciliationState(
+        const DeviceInfo& info,
+        const ReconciliationPlan& plan,
+        std::string_view command_id);
+    void publishDriftAlarm(
+        const DeviceInfo& info,
+        std::string_view command_id,
+        std::uint64_t desired_version,
+        std::size_t drift_count);
+    void clearDriftAlarm(
+        const DeviceInfo& info,
+        std::string_view command_id,
+        std::uint64_t desired_version);
 
     redis::RedisRepository device_db_;
     redis::RedisRepository state_db_;
     redis::RedisRepository counters_db_;
     redis::RedisRepository config_db_;
+    redis::RedisRepository alarm_db_;
     std::unique_ptr<OcsDeviceApi> device_;
     std::chrono::milliseconds pending_min_idle_;
     std::string device_name_;

@@ -41,6 +41,10 @@ inline constexpr std::string_view kFaultCommands = "OCS_FAULT_COMMANDS";
     return "OCS_CONNECTION|" + std::string(device) + "|" + std::string(connection_id);
 }
 
+[[nodiscard]] inline std::string connectionConfigPattern(std::string_view device) {
+    return "OCS_CONNECTION|" + std::string(device) + "|*";
+}
+
 [[nodiscard]] inline std::string connectionAppKey(
     std::string_view device,
     std::string_view connection_id) {
@@ -84,6 +88,53 @@ inline constexpr std::string_view kFaultCommands = "OCS_FAULT_COMMANDS";
     std::uint64_t generation) {
     return "OCS_SYNCD_GENERATION_COUNTERS_PUBLISHED|" + std::string(device) + "|" +
            std::to_string(generation);
+}
+
+[[nodiscard]] inline std::string syncdReconciliationKey(std::string_view device) {
+    return "OCS_SYNCD_RECONCILIATION|" + std::string(device);
+}
+
+[[nodiscard]] inline std::string syncdReconciliationCommandPublicationKey(
+    std::string_view command_id) {
+    return "OCS_SYNCD_RECONCILIATION_COMMAND_PUBLISHED|" + std::string(command_id);
+}
+
+[[nodiscard]] inline std::string syncdReconciliationStatePublicationKey(
+    std::string_view command_id,
+    std::string_view connection_id,
+    std::string_view phase) {
+    return "OCS_SYNCD_RECONCILIATION_STATE_PUBLISHED|" + std::string(command_id) + "|" +
+           std::string(connection_id) + "|" + std::string(phase);
+}
+
+[[nodiscard]] inline std::string syncdReconciliationCountersPublicationKey(
+    std::string_view command_id) {
+    return "OCS_SYNCD_RECONCILIATION_COUNTERS_PUBLISHED|" + std::string(command_id);
+}
+
+[[nodiscard]] inline std::string syncdReconciliationSuccessCountersPublicationKey(
+    std::string_view command_id) {
+    return "OCS_SYNCD_RECONCILIATION_SUCCESS_COUNTERS_PUBLISHED|" + std::string(command_id);
+}
+
+[[nodiscard]] inline std::string desiredActualDriftAlarmId() {
+    return "desired-actual-drift";
+}
+
+[[nodiscard]] inline std::string syncdDriftAlarmPublicationKey(std::string_view command_id) {
+    return "OCS_SYNCD_DRIFT_ALARM_PUBLISHED|" + std::string(command_id);
+}
+
+[[nodiscard]] inline std::string syncdDriftAlarmClearPublicationKey(std::string_view command_id) {
+    return "OCS_SYNCD_DRIFT_ALARM_CLEARED|" + std::string(command_id);
+}
+
+[[nodiscard]] inline std::string syncdDriftAlarmCounterPublicationKey(
+    std::string_view device,
+    std::string_view activation_id,
+    bool clear) {
+    return "OCS_SYNCD_DRIFT_ALARM_COUNTER_" + std::string(clear ? "CLEARED|" : "RAISED|") +
+           std::string(device) + "|" + std::string(activation_id);
 }
 
 [[nodiscard]] inline std::string processedDeviceCommandKey(std::string_view command_id) {

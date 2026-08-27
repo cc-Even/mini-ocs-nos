@@ -44,6 +44,7 @@ add_library(
     src/errors.cpp
     src/in_process_sim_backend.cpp
     src/orchestrator_service.cpp
+    src/reconciler.cpp
     src/redis_repository.cpp
     src/simulated_ocs_device.cpp
     src/syncd_service.cpp
@@ -117,6 +118,7 @@ if(BUILD_TESTING)
         ocs_core_test
         tests/device_test.cpp
         tests/orchestrator_test.cpp
+        tests/reconciler_test.cpp
         tests/redis_contract_test.cpp
         tests/syncd_integration_test.cpp
         tests/uds_codec_test.cpp

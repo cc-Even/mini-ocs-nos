@@ -82,6 +82,7 @@ enum class FaultType {
     kNextApplyTimeout,
     kInputPortDown,
     kOutputPortDown,
+    kOutOfBandDrift,
 };
 
 struct FaultSpec {

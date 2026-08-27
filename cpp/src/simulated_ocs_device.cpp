@@ -209,6 +209,16 @@ FaultResult SimulatedOcsDevice::injectFault(const FaultSpec& fault) {
         timeout_next_apply_ = true;
         return {Error::success()};
     }
+    if (fault.type == FaultType::kOutOfBandDrift) {
+        auto connection = connections_.begin();
+        if (connection == connections_.end()) {
+            return {makeError(ErrorCode::kInvalidArgument, "drift target connection was not found")};
+        }
+        input_to_output_.at(connection->second.input_port - 1) = std::nullopt;
+        output_to_input_.at(connection->second.output_port - 1) = std::nullopt;
+        connections_.erase(connection);
+        return {Error::success()};
+    }
 
     const auto direction = fault.type == FaultType::kInputPortDown ? PortDirection::kInput
                                                                    : PortDirection::kOutput;
@@ -228,6 +238,9 @@ FaultResult SimulatedOcsDevice::clearFault(const FaultSelector& selector) {
     }
     if (selector.type == FaultType::kNextApplyTimeout) {
         timeout_next_apply_ = false;
+        return {Error::success()};
+    }
+    if (selector.type == FaultType::kOutOfBandDrift) {
         return {Error::success()};
     }
 

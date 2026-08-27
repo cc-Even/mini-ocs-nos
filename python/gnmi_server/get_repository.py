@@ -44,6 +44,7 @@ _INTEGER_FIELDS: Final = {
     "created_at_ns",
     "desired_version",
     "device_generation",
+    "drift_count",
     "first_raised_ns",
     "input_port",
     "input_port_count",

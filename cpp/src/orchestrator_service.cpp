@@ -204,6 +204,10 @@ bool isGenerationRecovery(std::string_view command_id) {
     return command_id.starts_with("hwsim-recovery:");
 }
 
+bool isReconciliation(std::string_view command_id) {
+    return command_id.starts_with("reconcile:");
+}
+
 std::uint64_t retryAtNs(
     std::uint64_t now_ns,
     std::size_t retry_attempt,
@@ -490,11 +494,13 @@ bool OrchestratorService::processResultOne(
 
     const auto application_version = currentVersion(application);
     const auto current = currentStatus(application);
-    const bool generation_recovery =
-        isGenerationRecovery(result.value("command_id", std::string{})) ||
-        isGenerationRecovery(message.event.event_id);
+    const auto result_command_id = result.value("command_id", std::string{});
+    const bool recovery_result = isGenerationRecovery(result_command_id) ||
+                                 isGenerationRecovery(message.event.event_id) ||
+                                 isReconciliation(result_command_id) ||
+                                 isReconciliation(message.event.event_id);
     const bool recovering_failed_application =
-        generation_recovery && success &&
+        recovery_result && success &&
         (current == ConnectionApplyStatus::kFailed ||
          current == ConnectionApplyStatus::kRetryWait);
     if (message.event.desired_version <= application_version &&
@@ -515,7 +521,7 @@ bool OrchestratorService::processResultOne(
     if (success) {
         const auto operation = application.find("operation");
         const bool removing = current == ConnectionApplyStatus::kRemoving ||
-                              (generation_recovery &&
+                              (recovery_result &&
                                operation != application.end() && operation->second == "REMOVE");
         next = removing ? ConnectionApplyStatus::kAbsent : ConnectionApplyStatus::kActive;
     }

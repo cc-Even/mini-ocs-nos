@@ -326,4 +326,23 @@ TEST(InProcessSimBackendTest, RemovingAbsentConnectionIsIdempotent) {
     EXPECT_TRUE(backend->getConnections().empty());
 }
 
+TEST(InProcessSimBackendTest, InjectsOutOfBandDriftWithoutChangingDesiredVersionFence) {
+    auto backend = makeBackend();
+    const ocs::ConnectionCommand desired{
+        .id = "drifted",
+        .input_port = 3,
+        .output_port = 11,
+        .desired_version = 7,
+    };
+    ASSERT_TRUE(backend->applyConnections({desired}, {}).ok());
+
+    ASSERT_TRUE(
+        backend->injectFault({.type = ocs::FaultType::kOutOfBandDrift}).error.ok());
+    EXPECT_TRUE(backend->getConnections().empty());
+
+    ASSERT_TRUE(backend->applyConnections({desired}, {}).ok());
+    ASSERT_EQ(backend->getConnections().size(), 1);
+    EXPECT_EQ(backend->getConnections().front().applied_version, 7);
+}
+
 }  // namespace
