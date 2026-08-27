@@ -23,6 +23,14 @@ def device_config_pattern() -> str:
     return "OCS_DEVICE|*"
 
 
+def input_port_config_key(device: str, port_id: int) -> str:
+    return f"OCS_INPUT_PORT|{device}|{port_id}"
+
+
+def output_port_config_key(device: str, port_id: int) -> str:
+    return f"OCS_OUTPUT_PORT|{device}|{port_id}"
+
+
 def connection_config_key(device: str, connection_id: str) -> str:
     return f"OCS_CONNECTION|{device}|{connection_id}"
 

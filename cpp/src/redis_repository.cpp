@@ -140,6 +140,104 @@ void RedisRepository::replaceHashAndAppendEvent(
     static_cast<void>(transaction.exec());
 }
 
+bool RedisRepository::replaceHashAndAppendEventOnce(
+    const std::string& marker_key,
+    const std::map<std::string, std::string>& marker_fields,
+    const std::string& key,
+    const std::map<std::string, std::string>& fields,
+    const std::string& stream,
+    const EventEnvelope& event) {
+    validateEvent(event);
+    const auto event_fields = eventFields(event);
+    while (true) {
+        auto transaction = impl_->redis.transaction();
+        auto watched = transaction.redis();
+        watched.watch(marker_key);
+        if (watched.exists(marker_key) != 0) {
+            watched.unwatch();
+            return false;
+        }
+        transaction.del(key);
+        if (!fields.empty()) {
+            transaction.hmset(key, fields.begin(), fields.end());
+        }
+        transaction.xadd(stream, "*", event_fields.begin(), event_fields.end());
+        transaction.hmset(marker_key, marker_fields.begin(), marker_fields.end());
+        try {
+            static_cast<void>(transaction.exec());
+            return true;
+        } catch (const sw::redis::WatchError&) {
+            continue;
+        }
+    }
+}
+
+bool RedisRepository::appendEventOnce(
+    const std::string& marker_key,
+    const std::map<std::string, std::string>& marker_fields,
+    const std::string& stream,
+    const EventEnvelope& event) {
+    validateEvent(event);
+    const auto event_fields = eventFields(event);
+    while (true) {
+        auto transaction = impl_->redis.transaction();
+        auto watched = transaction.redis();
+        watched.watch(marker_key);
+        if (watched.exists(marker_key) != 0) {
+            watched.unwatch();
+            return false;
+        }
+        transaction.xadd(stream, "*", event_fields.begin(), event_fields.end());
+        transaction.hmset(marker_key, marker_fields.begin(), marker_fields.end());
+        try {
+            static_cast<void>(transaction.exec());
+            return true;
+        } catch (const sw::redis::WatchError&) {
+            continue;
+        }
+    }
+}
+
+bool RedisRepository::incrementHashFieldsOnce(
+    const std::string& marker_key,
+    const std::map<std::string, std::string>& marker_fields,
+    const std::string& key,
+    const std::map<std::string, long long>& increments) {
+    while (true) {
+        auto transaction = impl_->redis.transaction();
+        auto watched = transaction.redis();
+        watched.watch(marker_key);
+        if (watched.exists(marker_key) != 0) {
+            watched.unwatch();
+            return false;
+        }
+        for (const auto& [field, increment] : increments) {
+            if (increment != 0) {
+                transaction.hincrby(key, field, increment);
+            }
+        }
+        transaction.hmset(marker_key, marker_fields.begin(), marker_fields.end());
+        try {
+            static_cast<void>(transaction.exec());
+            return true;
+        } catch (const sw::redis::WatchError&) {
+            continue;
+        }
+    }
+}
+
+void RedisRepository::putHashesAtomically(
+    const std::vector<std::pair<std::string, std::map<std::string, std::string>>>& hashes) {
+    auto transaction = impl_->redis.transaction();
+    for (const auto& [key, fields] : hashes) {
+        transaction.del(key);
+        if (!fields.empty()) {
+            transaction.hmset(key, fields.begin(), fields.end());
+        }
+    }
+    static_cast<void>(transaction.exec());
+}
+
 std::string RedisRepository::appendEvent(const std::string& stream, const EventEnvelope& event) {
     validateEvent(event);
     const auto fields = eventFields(event);

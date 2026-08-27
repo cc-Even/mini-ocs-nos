@@ -340,15 +340,32 @@ def build_candidate(
             updated_at_ns=updated_at_ns,
         )
 
-    changes = tuple(
-        CandidateChange(
-            connection_id=connection_id,
-            operation="UPSERT" if connection_id in finalized else "REMOVE",
-            config=finalized.get(connection_id),
+    changes: list[CandidateChange] = []
+    for connection_id in touched:
+        existing = current.get(connection_id)
+        finalized_config = finalized.get(connection_id)
+        if existing is None and finalized_config is None:
+            continue
+        if existing is not None and finalized_config is not None:
+            unchanged = (
+                existing.input_port == finalized_config.input_port
+                and existing.output_port == finalized_config.output_port
+                and existing.admin_status == finalized_config.admin_status
+            )
+            if unchanged:
+                continue
+        changes.append(
+            CandidateChange(
+                connection_id=connection_id,
+                operation="UPSERT" if finalized_config is not None else "REMOVE",
+                config=finalized_config,
+            )
         )
-        for connection_id in touched
+    return CandidateMutation(
+        revision=revision,
+        timestamp_ns=timestamp_ns,
+        changes=tuple(changes),
     )
-    return CandidateMutation(revision=revision, timestamp_ns=timestamp_ns, changes=changes)
 
 
 class SetTransaction:

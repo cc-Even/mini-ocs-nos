@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 import uuid
@@ -16,7 +17,12 @@ from redis.backoff import NoBackoff
 from redis.exceptions import RedisError, WatchError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
-from gnmi_server.errors import DeadlineExceededError, DependencyUnavailableError
+from gnmi_server.errors import (
+    ConflictError,
+    DeadlineExceededError,
+    DependencyUnavailableError,
+    NotFoundError,
+)
 from gnmi_server.redis_keys import (
     CONFIG_DB,
     CONFIG_EVENTS,
@@ -24,9 +30,10 @@ from gnmi_server.redis_keys import (
     connection_config_key,
     connection_config_pattern,
     device_config_key,
+    input_port_config_key,
+    output_port_config_key,
 )
 from gnmi_server.set_transaction import (
-    DEFAULT_PORT_COUNT,
     CandidateChange,
     ConnectionConfig,
     SetCommitResult,
@@ -129,15 +136,18 @@ class RedisConfigRepository:
 
     async def _commit_once(self, plan: SetPlan) -> SetCommitResult:
         revision_key = config_revision_key(plan.device)
+        device_key = device_config_key(plan.device)
         async with self._client.pipeline(transaction=True) as pipe:
-            await pipe.watch(revision_key)
+            await pipe.watch(revision_key, device_key)
             raw_revision = await pipe.get(revision_key)
             try:
                 current_revision = int(raw_revision) if raw_revision is not None else 0
             except ValueError as error:
                 raise RuntimeError("CONFIG_DB revision is not an integer") from error
             current = await self._load_connections(pipe, plan.device)
-            input_count, output_count = await self._load_port_counts(pipe, plan.device)
+            input_count, output_count = await self._load_port_counts(
+                pipe, plan.device, device_key
+            )
             timestamp_ns = self._timestamp_factory()
             candidate = build_candidate(
                 current,
@@ -147,6 +157,11 @@ class RedisConfigRepository:
                 input_port_count=input_count,
                 output_port_count=output_count,
             )
+            await self._validate_ports_enabled(pipe, plan.device, candidate.changes)
+
+            if not candidate.changes:
+                await pipe.unwatch()
+                return SetCommitResult(timestamp_ns=timestamp_ns, operations=plan.operations)
 
             pipe.multi()
             for change in candidate.changes:
@@ -155,16 +170,15 @@ class RedisConfigRepository:
                 if change.config is not None:
                     pipe.hset(key, mapping=change.config.redis_fields(plan.device))
             pipe.set(revision_key, candidate.revision)
-            for change in candidate.changes:
-                pipe.xadd(
-                    CONFIG_EVENTS,
-                    self._event_fields(
-                        plan,
-                        candidate.revision,
-                        candidate.timestamp_ns,
-                        change,
-                    ),
-                )
+            pipe.xadd(
+                CONFIG_EVENTS,
+                self._event_fields(
+                    plan,
+                    candidate.revision,
+                    candidate.timestamp_ns,
+                    candidate.changes,
+                ),
+            )
             await pipe.execute()
             return SetCommitResult(timestamp_ns=timestamp_ns, operations=plan.operations)
 
@@ -181,33 +195,88 @@ class RedisConfigRepository:
                 current[connection_id] = ConnectionConfig.from_redis(connection_id, fields)
         return current
 
-    async def _load_port_counts(self, pipe, device: str) -> tuple[int, int]:
-        fields = await pipe.hgetall(device_config_key(device))
+    async def _load_port_counts(
+        self, pipe, device: str, device_key: str
+    ) -> tuple[int, int]:
+        fields = await pipe.hgetall(device_key)
+        if not fields:
+            raise NotFoundError(f"device {device!r}")
+        configured_name = fields.get("name", device)
+        if configured_name != device:
+            raise RuntimeError("CONFIG_DB device name does not match its key")
+        if fields.get("admin_status", "ENABLED") != "ENABLED":
+            raise ConflictError(f"device {device!r} is administratively disabled")
         try:
-            input_count = int(fields.get("input_port_count", DEFAULT_PORT_COUNT))
-            output_count = int(fields.get("output_port_count", DEFAULT_PORT_COUNT))
+            input_count = int(fields["input_port_count"])
+            output_count = int(fields["output_port_count"])
+        except KeyError as error:
+            raise RuntimeError("CONFIG_DB device port count is missing") from error
         except ValueError as error:
             raise RuntimeError("CONFIG_DB device port count is not an integer") from error
         if input_count <= 0 or output_count <= 0:
             raise RuntimeError("CONFIG_DB device port counts must be positive")
         return input_count, output_count
 
+    async def _validate_ports_enabled(
+        self,
+        pipe,
+        device: str,
+        changes: tuple[CandidateChange, ...],
+    ) -> None:
+        ports = {
+            (change.config.input_port, change.config.output_port)
+            for change in changes
+            if change.config is not None
+        }
+        keys = [
+            key
+            for input_port, output_port in sorted(ports)
+            for key in (
+                input_port_config_key(device, input_port),
+                output_port_config_key(device, output_port),
+            )
+        ]
+        if keys:
+            await pipe.watch(*keys)
+        for input_port, output_port in sorted(ports):
+            input_fields = await pipe.hgetall(input_port_config_key(device, input_port))
+            output_fields = await pipe.hgetall(output_port_config_key(device, output_port))
+            if input_fields.get("admin_status", "ENABLED") != "ENABLED":
+                raise ConflictError(f"input port {input_port} is administratively disabled")
+            if output_fields.get("admin_status", "ENABLED") != "ENABLED":
+                raise ConflictError(f"output port {output_port} is administratively disabled")
+
     def _event_fields(
         self,
         plan: SetPlan,
         desired_version: int,
         timestamp_ns: int,
-        change: CandidateChange,
+        changes: tuple[CandidateChange, ...],
     ) -> dict[str, str]:
+        commands = []
+        for change in changes:
+            command: dict[str, int | str] = {
+                "operation": change.operation,
+                "id": change.connection_id,
+                "desired_version": desired_version,
+            }
+            if change.config is not None:
+                command["input_port"] = change.config.input_port
+                command["output_port"] = change.config.output_port
+            commands.append(command)
         return {
             "event_schema_version": str(EVENT_SCHEMA_VERSION),
             "event_id": str(self._event_id_factory()),
             "request_id": plan.request_id,
             "timestamp_ns": str(timestamp_ns),
             "device": plan.device,
-            "resource_type": "connection",
-            "resource_id": change.connection_id,
-            "operation": change.operation,
+            "resource_type": "connection-batch",
+            "resource_id": plan.request_id,
+            "operation": "APPLY_BATCH",
             "desired_version": str(desired_version),
-            "payload": change.config.event_payload() if change.config is not None else "{}",
+            "payload": json.dumps(
+                {"commands": commands, "atomic": True, "timeout_ms": 1000},
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
         }

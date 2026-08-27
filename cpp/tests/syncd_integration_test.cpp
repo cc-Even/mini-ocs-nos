@@ -12,7 +12,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace {
 
@@ -199,6 +202,72 @@ TEST_F(SyncdIntegrationTest, FailedUpdatePreservesLastConfirmedActualConnection)
     EXPECT_EQ(actual.front().applied_version, 1);
 }
 
+TEST_F(SyncdIntegrationTest, ActiveCounterTracksActualPresenceAcrossFailedRecovery) {
+    const auto append_command = [this](
+                                    std::string event_id,
+                                    ocs::ConnectionOperation operation,
+                                    ocs::PortId input_port,
+                                    ocs::PortId output_port,
+                                    std::uint64_t desired_version) {
+        const ocs::DeviceCommandBatch batch{
+            .commands = {{
+                .operation = operation,
+                .id = "conn-accounting",
+                .input_port = input_port,
+                .output_port = output_port,
+                .desired_version = desired_version,
+            }},
+            .options = {},
+        };
+        const ocs::redis::EventEnvelope event{
+            .event_schema_version = 1,
+            .event_id = std::move(event_id),
+            .request_id = "request-accounting-" + std::to_string(desired_version),
+            .timestamp_ns = 1780000000000000050ULL + desired_version,
+            .device = "ocs0",
+            .resource_type = "connection",
+            .resource_id = "conn-accounting",
+            .operation = operation == ocs::ConnectionOperation::kRemove ? "REMOVE" : "UPSERT",
+            .desired_version = desired_version,
+            .payload = ocs::encodeDeviceCommand(batch),
+        };
+        static_cast<void>(device_db_->appendEvent(
+            std::string(ocs::redis::kDeviceCommands), event));
+        ASSERT_TRUE(syncd_->processOne("accounting-consumer"));
+    };
+    const auto active_count = [this] {
+        return counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"))
+            .at("active_connections");
+    };
+
+    append_command("accounting-1", ocs::ConnectionOperation::kUpsert, 1, 9, 1);
+    EXPECT_EQ(active_count(), "1");
+
+    ASSERT_TRUE(simulated_device_->injectFault({.type = ocs::FaultType::kNextApplyError}).error.ok());
+    append_command("accounting-2", ocs::ConnectionOperation::kUpsert, 2, 10, 2);
+    EXPECT_EQ(active_count(), "1");
+    EXPECT_EQ(
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "conn-accounting"))
+            .at("actual_present"),
+        "true");
+
+    append_command("accounting-3", ocs::ConnectionOperation::kUpsert, 2, 10, 3);
+    EXPECT_EQ(active_count(), "1");
+
+    ASSERT_TRUE(simulated_device_->injectFault({.type = ocs::FaultType::kNextApplyError}).error.ok());
+    append_command("accounting-4", ocs::ConnectionOperation::kRemove, 0, 0, 4);
+    EXPECT_EQ(active_count(), "1");
+    EXPECT_EQ(
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "conn-accounting"))
+            .at("actual_present"),
+        "true");
+
+    append_command("accounting-5", ocs::ConnectionOperation::kRemove, 0, 0, 5);
+    EXPECT_EQ(active_count(), "0");
+    EXPECT_TRUE(
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "conn-accounting")).empty());
+}
+
 TEST_F(SyncdIntegrationTest, ClaimsProcessedCommandAfterCrashWithoutRepeatingSideEffects) {
     const std::string result_group = "crash-result-test";
     const std::string state_group = "crash-state-test";
@@ -281,6 +350,126 @@ TEST_F(SyncdIntegrationTest, ClaimsProcessedCommandAfterCrashWithoutRepeatingSid
     ASSERT_EQ(actual.size(), 1);
     EXPECT_EQ(actual.front().id, "conn-crash");
     EXPECT_EQ(actual.front().applied_version, 1);
+}
+
+TEST_F(SyncdIntegrationTest, RecoversIdempotentlyAfterEveryPersistenceBoundary) {
+    const std::string result_group = "phase-result-test";
+    const std::string state_group = "phase-state-test";
+    device_db_->createConsumerGroup(std::string(ocs::redis::kDeviceResults), result_group);
+    state_db_->createConsumerGroup(std::string(ocs::redis::kStateEvents), state_group);
+    const std::vector<std::string> phases{
+        "device-apply", "apply-result", "state", "counters", "result", "processed"};
+
+    struct SimulatedCrash {};
+    for (std::size_t index = 0; index < phases.size(); ++index) {
+        const auto desired_version = static_cast<std::uint64_t>(index + 1);
+        const std::string connection_id = "phase-" + std::to_string(index + 1);
+        const std::string command_id = "command-phase-" + std::to_string(index + 1);
+        const ocs::DeviceCommandBatch batch{
+            .commands = {{
+                .id = connection_id,
+                .input_port = static_cast<ocs::PortId>(index + 1),
+                .output_port = static_cast<ocs::PortId>(index + 9),
+                .desired_version = desired_version,
+            }},
+            .options = {},
+        };
+        const ocs::redis::EventEnvelope event{
+            .event_schema_version = 1,
+            .event_id = command_id,
+            .request_id = "request-phase-" + std::to_string(index + 1),
+            .timestamp_ns = 1780000000000000200ULL + index,
+            .device = "ocs0",
+            .resource_type = "connection",
+            .resource_id = connection_id,
+            .operation = "UPSERT",
+            .desired_version = desired_version,
+            .payload = ocs::encodeDeviceCommand(batch),
+        };
+        static_cast<void>(device_db_->appendEvent(
+            std::string(ocs::redis::kDeviceCommands), event));
+
+        const auto crash_phase = phases.at(index);
+        EXPECT_THROW(
+            static_cast<void>(syncd_->processOne(
+                "phase-crashing-consumer",
+                {},
+                [&crash_phase](std::string_view phase) {
+                    if (phase == crash_phase) {
+                        throw SimulatedCrash{};
+                    }
+                })),
+            SimulatedCrash);
+        EXPECT_EQ(
+            device_db_->pendingCount(std::string(ocs::redis::kDeviceCommands), "ocs-syncd"),
+            1);
+
+        syncd_.reset();
+        syncd_ = std::make_unique<ocs::SyncdService>(
+            endpoint_,
+            std::make_unique<ocs::UdsDeviceBackend>(hwsim_socket_),
+            std::chrono::milliseconds(0));
+        syncd_->initialize();
+        ASSERT_TRUE(syncd_->processOne("phase-recovery-consumer"));
+        EXPECT_EQ(
+            device_db_->pendingCount(std::string(ocs::redis::kDeviceCommands), "ocs-syncd"),
+            0);
+        EXPECT_EQ(
+            state_db_->getHash(ocs::redis::connectionStateKey("ocs0", connection_id))
+                .at("apply_status"),
+            "ACTIVE");
+    }
+
+    const auto state_events = state_db_->readGroup(
+        std::string(ocs::redis::kStateEvents), state_group, "phase-state-consumer", 100);
+    const auto result_events = device_db_->readGroup(
+        std::string(ocs::redis::kDeviceResults), result_group, "phase-result-consumer", 100);
+    EXPECT_EQ(state_events.size(), phases.size());
+    EXPECT_EQ(result_events.size(), phases.size());
+    const auto counters = counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"));
+    EXPECT_EQ(counters.at("device_apply_total"), std::to_string(phases.size()));
+    EXPECT_EQ(counters.at("device_apply_success_total"), std::to_string(phases.size()));
+    EXPECT_EQ(counters.at("active_connections"), std::to_string(phases.size()));
+    EXPECT_EQ(simulated_device_->getConnections().size(), phases.size());
+}
+
+TEST_F(SyncdIntegrationTest, RejectsCommandForDifferentConnectedDevice) {
+    const std::string result_group = "identity-result-test";
+    device_db_->createConsumerGroup(std::string(ocs::redis::kDeviceResults), result_group);
+    const ocs::DeviceCommandBatch batch{
+        .commands = {{
+            .id = "wrong-device",
+            .input_port = 1,
+            .output_port = 9,
+            .desired_version = 1,
+        }},
+        .options = {},
+    };
+    const ocs::redis::EventEnvelope event{
+        .event_schema_version = 1,
+        .event_id = "command-wrong-device",
+        .request_id = "request-wrong-device",
+        .timestamp_ns = 1780000000000000300ULL,
+        .device = "ocs1",
+        .resource_type = "connection",
+        .resource_id = "wrong-device",
+        .operation = "UPSERT",
+        .desired_version = 1,
+        .payload = ocs::encodeDeviceCommand(batch),
+    };
+    static_cast<void>(device_db_->appendEvent(
+        std::string(ocs::redis::kDeviceCommands), event));
+
+    ASSERT_TRUE(syncd_->processOne("identity-consumer"));
+
+    EXPECT_TRUE(simulated_device_->getConnections().empty());
+    const auto results = device_db_->readGroup(
+        std::string(ocs::redis::kDeviceResults), result_group, "identity-result-consumer");
+    ASSERT_EQ(results.size(), 1);
+    EXPECT_NE(results.front().event.payload.find("OCS_DEVICE_NOT_READY"), std::string::npos);
+    const auto counters = counters_db_->getHash(ocs::redis::deviceCountersKey("ocs1"));
+    EXPECT_EQ(counters.at("device_apply_total"), "1");
+    EXPECT_EQ(counters.at("device_apply_failure_total"), "1");
 }
 
 }  // namespace

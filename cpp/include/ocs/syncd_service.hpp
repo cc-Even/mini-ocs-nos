@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 
 namespace ocs {
 
@@ -21,18 +22,27 @@ public:
     void initialize();
     [[nodiscard]] bool processOne(
         const std::string& consumer_name,
-        const std::function<void()>& before_ack = {});
+        const std::function<void()>& before_ack = {},
+        const std::function<void(std::string_view)>& after_phase = {});
 
 private:
     [[nodiscard]] bool isAlreadyProcessed(const redis::EventEnvelope& command_event);
-    [[nodiscard]] bool isStaleVersion(const redis::EventEnvelope& command_event);
-    void markProcessed(const redis::EventEnvelope& command_event, bool applied);
+    [[nodiscard]] bool isStaleVersion(
+        const redis::EventEnvelope& command_event,
+        const DeviceCommandBatch& batch);
+    void markProcessed(
+        const redis::EventEnvelope& command_event,
+        const DeviceCommandBatch& batch,
+        bool applied);
     void acknowledge(const std::string& message_id);
-    void publishState(
+    [[nodiscard]] long long publishState(
         const redis::EventEnvelope& command_event,
         const DeviceCommandBatch& batch,
         const ApplyResult& result);
-    void publishResult(const redis::EventEnvelope& command_event, const ApplyResult& result);
+    void publishResult(
+        const redis::EventEnvelope& command_event,
+        const DeviceCommandBatch& batch,
+        const ApplyResult& result);
 
     redis::RedisRepository device_db_;
     redis::RedisRepository state_db_;

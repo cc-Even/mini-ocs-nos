@@ -10,6 +10,7 @@ import grpc
 import pytest
 from gnmi_server.get_repository import RedisGetRepository
 from gnmi_server.get_transaction import GetTransaction
+from gnmi_server.redis_keys import device_config_key
 from gnmi_server.redis_repository import RedisConfigRepository, RedisSettings, create_redis_client
 from gnmi_server.server import create_server
 from gnmi_server.service import GnmiService
@@ -75,6 +76,15 @@ async def test_scenarios_a_and_b_through_ocsctl_and_gnmi(tmp_path: Path) -> None
     cleanup_clients = [create_redis_client(settings, database) for database in (0, 1, 2, 4, 6, 8)]
     for client in cleanup_clients:
         await client.flushdb()
+    await cleanup_clients[3].hset(
+        device_config_key("ocs0"),
+        mapping={
+            "name": "ocs0",
+            "input_port_count": "16",
+            "output_port_count": "16",
+            "admin_status": "ENABLED",
+        },
+    )
 
     hwsim_socket = tmp_path / "ocs-hwsim.sock"
     executable_root = REPOSITORY_ROOT / "build" / "dev" / "cpp"

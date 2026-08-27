@@ -147,6 +147,14 @@ def test_delete_produces_versioned_remove_without_mutating_input() -> None:
     assert current == {"a": original}
 
 
+def test_deleting_missing_connection_is_an_idempotent_noop() -> None:
+    plan = _plan(gnmi_pb2.SetRequest(delete=[_config_path("missing")]))
+
+    mutation = build_candidate({}, plan, revision=7, timestamp_ns=700)
+
+    assert mutation.changes == ()
+
+
 def test_conflicting_batch_fails_without_mutating_current() -> None:
     original = ConnectionConfig("existing", 1, 9, desired_version=1)
     current = {"existing": original}

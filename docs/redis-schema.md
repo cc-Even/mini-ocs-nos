@@ -17,6 +17,9 @@ keys use `TABLE|device|resource-id`; device-level keys omit the resource suffix.
 DEVICE_DB also keeps `OCS_SYNCD_CONNECTION_VERSION|device|id` as the last
 successfully applied resource version and
 `OCS_PROCESSED_DEVICE_COMMAND|command-id` as the durable exact-command marker.
+Per-phase `OCS_DEVICE_APPLY_*` and `OCS_SYNCD_*_PUBLISHED` hashes make recovery
+of device execution, state, counters, and result publication independently
+idempotent.
 
 Every stream message uses this v1 envelope:
 
@@ -53,13 +56,20 @@ This preserves monotonic resource versions across delete and later recreation.
 The writer watches the revision and uses bounded retries to prevent concurrent
 requests from losing updates.
 
+The target `OCS_DEVICE|device` must exist with explicit positive input and
+output port counts; its key identity must match the requested device. An
+administratively disabled device, input port, or output port rejects the
+candidate. Device and referenced port keys are watched through commit so an
+administrative-state change cannot race validation.
+
 One CONFIG_DB `MULTI/EXEC` replaces or deletes all affected
 `OCS_CONNECTION|device|id` hashes, advances the revision, and appends a
-compatible `UPSERT` or `REMOVE` event for each final resource change to
-`OCS_CONFIG_EVENTS`. All events from one request share its request ID, revision,
-and timestamp. A validation failure executes no Redis write, and a successful
-SetResponse confirms only this atomic desired-state persistence—not hardware
-application.
+single `connection-batch` event containing every final `UPSERT` and `REMOVE` to
+`OCS_CONFIG_EVENTS`. This preserves the Set transaction boundary through the
+device plane. Deleting a missing connection, including a repeated delete, is a
+successful no-op that does not advance the revision or append an event. A
+validation failure executes no Redis write, and a successful SetResponse
+confirms only this atomic desired-state persistence—not hardware application.
 
 Integration tests keep Redis on an internal Docker network with protected mode
 enabled and no published TCP port. A random temporary Unix socket is mounted for
@@ -112,8 +122,11 @@ batch:
 
 Successful UPSERT commands replace `OCS_CONNECTION_STATE|device|id` in
 STATE_DB with the confirmed ports, desired/applied versions, and `ACTIVE`
-status. Each state replacement or deletion and its compatible UPSERT or REMOVE
-entry in `OCS_STATE_EVENTS` occur in one STATE_DB transaction. Successful
+status. `actual_present` records confirmed hardware presence independently of
+the last apply status, so a failed update or delete cannot corrupt active
+connection accounting. Each state replacement or deletion, its compatible
+UPSERT or REMOVE entry in `OCS_STATE_EVENTS`, and its publication marker occur
+in one STATE_DB transaction. Successful
 REMOVE commands delete that state key; removing an already absent device
 connection is an idempotent success so a delete can converge after an older
 create fails. Every attempt
@@ -125,11 +138,12 @@ the stable device error. A failed create without prior actual state uses applied
 version zero. Hash snapshots are replaced with a Redis transaction so readers
 cannot observe the intermediate delete used to remove obsolete fields.
 
-Each processed command appends an `APPLY_RESULT` event to
+Each processed batch appends one `APPLY_RESULT` event per command to
 `OCS_DEVICE_RESULTS`. Its payload records `success`, `error_code`, and
-`error_message`, while its envelope preserves the command request and desired
-version. syncd acknowledges the command only after the state, counters, and
-result publication steps have all completed.
+`error_message`, while its envelope preserves the command request and that
+resource's desired version. syncd rejects an envelope whose device does not
+match the connected backend identity. It acknowledges the command only after
+the state, counters, and result publication steps have all completed.
 
 Before applying a command, syncd checks the durable command marker and the last
 successful resource version. An already processed command ID, or a command no
@@ -137,6 +151,16 @@ newer than the recorded successful version, is acknowledged without touching
 the device or incrementing apply counters. A completed attempt records its
 command ID before ACK; a successful device apply also advances the resource
 version. These records survive an ordinary syncd restart.
+
+Before device execution, syncd writes an attempt record. The device result is
+then durably stored before Redis-derived side effects begin. If the process
+exits after hardware success but before storing that result, recovery compares
+the full atomic batch against the device's actual connections and does not
+repeat an already completed apply. State publication, counter increments, and
+each result event use their own atomic once marker. The processed-command marker
+and all successful per-resource version markers are written in one DEVICE_DB
+transaction. Therefore recovery can resume after any persistence boundary
+without losing or duplicating those effects.
 
 Each syncd loop first performs a bounded XPENDING scan and XCLAIM for commands
 whose idle time exceeds `OCS_SYNCD_PENDING_MIN_IDLE_MS` (five seconds by
@@ -151,12 +175,13 @@ counts remain one after recovery.
 ## Orchestration contract
 
 `ocs-orch` consumes `OCS_CONFIG_EVENTS` from CONFIG_DB through the `ocs-orch`
-consumer group. A connection `UPSERT` payload contains `input_port` and
-`output_port`; `REMOVE` identifies the connection in the event envelope. The
-orchestrator validates the event, advances the centralized connection state
-machine, writes `OCS_CONNECTION_APP|device|id` in APPL_DB, and emits one atomic
-batch to `OCS_DEVICE_COMMANDS` in DEVICE_DB. The command event ID is derived
-from the configuration event ID so the relationship remains traceable.
+consumer group. New management writes use one `connection-batch` payload with
+the complete Set change set; legacy single-connection `UPSERT` and `REMOVE`
+events remain readable for recovery compatibility. The orchestrator validates
+the event, advances each affected centralized connection state machine, writes
+`OCS_CONNECTION_APP|device|id` in APPL_DB, and emits the complete change set as
+one atomic batch to `OCS_DEVICE_COMMANDS` in DEVICE_DB. The command event ID is
+derived from the configuration event ID so the relationship remains traceable.
 
 The application state is `APPLYING` or `REMOVING` while the device command is
 outstanding. `ocs-orch` separately consumes `OCS_DEVICE_RESULTS`, moves a

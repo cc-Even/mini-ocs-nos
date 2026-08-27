@@ -14,6 +14,8 @@ from gnmi_server.redis_keys import (
     CONFIG_EVENTS,
     config_revision_key,
     connection_config_key,
+    device_config_key,
+    input_port_config_key,
 )
 from gnmi_server.redis_repository import RedisConfigRepository, RedisSettings
 from gnmi_server.server import create_server
@@ -61,16 +63,38 @@ async def test_conflicting_set_leaves_snapshot_revision_and_stream_unchanged() -
     service = GnmiService(SetTransaction(repository))
     server, port = create_server("127.0.0.1:0", service)
     await repository.flush_for_test()
+    await observer.hset(
+        device_config_key("ocs0"),
+        mapping={
+            "name": "ocs0",
+            "input_port_count": "16",
+            "output_port_count": "16",
+            "admin_status": "ENABLED",
+        },
+    )
     await server.start()
     channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
     stub = gnmi_pb2_grpc.gNMIStub(channel)
     try:
         accepted = await stub.Set(
-            gnmi_pb2.SetRequest(update=[_update("existing", 1, 9)]),
+            gnmi_pb2.SetRequest(
+                update=[_update("existing", 1, 9), _update("peer", 2, 10)]
+            ),
             timeout=2.0,
         )
         assert accepted.timestamp > 0
-        assert [response.op for response in accepted.response] == [gnmi_pb2.UpdateResult.UPDATE]
+        assert [response.op for response in accepted.response] == [
+            gnmi_pb2.UpdateResult.UPDATE,
+            gnmi_pb2.UpdateResult.UPDATE,
+        ]
+
+        swapped = await stub.Set(
+            gnmi_pb2.SetRequest(
+                update=[_update("existing", 1, 10), _update("peer", 2, 9)]
+            ),
+            timeout=2.0,
+        )
+        assert len(swapped.response) == 2
 
         async with asyncio.timeout(2.0):
             revision_before = await observer.get(config_revision_key("ocs0"))
@@ -78,14 +102,15 @@ async def test_conflicting_set_leaves_snapshot_revision_and_stream_unchanged() -
             existing_before = await observer.hgetall(
                 connection_config_key("ocs0", "existing")
             )
-        assert revision_before == "1"
-        assert stream_length_before == 1
-        assert existing_before["desired_version"] == "1"
+        assert revision_before == "2"
+        assert stream_length_before == 2
+        assert existing_before["desired_version"] == "2"
+        assert existing_before["output_port"] == "10"
 
         conflict = gnmi_pb2.SetRequest(
             update=[
-                _update("conflict-a", 2, 12),
-                _update("conflict-b", 3, 12),
+                _update("conflict-a", 3, 12),
+                _update("conflict-b", 4, 12),
             ]
         )
         with pytest.raises(grpc.aio.AioRpcError) as raised:
@@ -103,13 +128,94 @@ async def test_conflicting_set_leaves_snapshot_revision_and_stream_unchanged() -
             assert not await observer.exists(connection_config_key("ocs0", "conflict-b"))
 
             events = await observer.xrange(CONFIG_EVENTS)
-        assert len(events) == 1
-        event = events[0][1]
-        assert event["operation"] == "UPSERT"
-        assert event["resource_id"] == "existing"
-        assert json.loads(event["payload"]) == {"input_port": 1, "output_port": 9}
+        assert len(events) == 2
+        event = events[-1][1]
+        assert event["operation"] == "APPLY_BATCH"
+        assert event["resource_type"] == "connection-batch"
+        payload = json.loads(event["payload"])
+        assert payload["atomic"] is True
+        assert payload["commands"] == [
+            {
+                "desired_version": 2,
+                "id": "existing",
+                "input_port": 1,
+                "operation": "UPSERT",
+                "output_port": 10,
+            },
+            {
+                "desired_version": 2,
+                "id": "peer",
+                "input_port": 2,
+                "operation": "UPSERT",
+                "output_port": 9,
+            },
+        ]
     finally:
         await channel.close()
         await server.stop(0.5)
         await service.close()
+        await observer.aclose()
+
+
+async def test_set_rejects_unknown_device_and_disabled_port_without_writes() -> None:
+    socket_path = os.environ["OCS_REDIS_SOCKET"]
+    settings = RedisSettings(unix_socket=socket_path)
+    repository = RedisConfigRepository(settings)
+    observer = redis_async.Redis(
+        unix_socket_path=socket_path,
+        db=CONFIG_DB,
+        decode_responses=True,
+        socket_connect_timeout=1.0,
+        socket_timeout=1.0,
+    )
+    await repository.flush_for_test()
+    try:
+        service = GnmiService(SetTransaction(repository))
+        server, port = create_server("127.0.0.1:0", service)
+        await server.start()
+        channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
+        stub = gnmi_pb2_grpc.gNMIStub(channel)
+        try:
+            with pytest.raises(grpc.aio.AioRpcError) as unknown:
+                await stub.Set(
+                    gnmi_pb2.SetRequest(update=[_update("unknown", 1, 9)]),
+                    timeout=2.0,
+                )
+            assert unknown.value.code() is grpc.StatusCode.NOT_FOUND
+
+            await observer.hset(
+                device_config_key("ocs0"),
+                mapping={
+                    "name": "ocs0",
+                    "input_port_count": "16",
+                    "output_port_count": "16",
+                },
+            )
+            await observer.hset(
+                input_port_config_key("ocs0", 1),
+                mapping={"admin_status": "DISABLED"},
+            )
+            with pytest.raises(grpc.aio.AioRpcError) as disabled:
+                await stub.Set(
+                    gnmi_pb2.SetRequest(update=[_update("disabled", 1, 9)]),
+                    timeout=2.0,
+                )
+            assert disabled.value.code() is grpc.StatusCode.INVALID_ARGUMENT
+            assert "administratively disabled" in disabled.value.details()
+
+            for _ in range(2):
+                deleted = await stub.Set(
+                    gnmi_pb2.SetRequest(delete=[_config_path("missing")]),
+                    timeout=2.0,
+                )
+                assert [response.op for response in deleted.response] == [
+                    gnmi_pb2.UpdateResult.DELETE
+                ]
+            assert await observer.xlen(CONFIG_EVENTS) == 0
+            assert await observer.get(config_revision_key("ocs0")) is None
+        finally:
+            await channel.close()
+            await server.stop(0.5)
+            await service.close()
+    finally:
         await observer.aclose()

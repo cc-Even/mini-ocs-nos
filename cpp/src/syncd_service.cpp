@@ -32,6 +32,67 @@ std::string resultPayload(const ApplyResult& result) {
     }.dump();
 }
 
+std::string durableResultPayload(const ApplyResult& result) {
+    nlohmann::json connections = nlohmann::json::array();
+    for (const auto& connection : result.connections) {
+        connections.push_back({
+            {"id", connection.id},
+            {"input_port", connection.input_port},
+            {"output_port", connection.output_port},
+            {"applied_version", connection.applied_version},
+        });
+    }
+    return nlohmann::json{
+        {"success", result.ok()},
+        {"error_code", toString(result.error.code)},
+        {"error_message", result.error.message},
+        {"connections", std::move(connections)},
+    }.dump();
+}
+
+ApplyResult decodeDurableResult(const std::string& payload) {
+    const auto value = nlohmann::json::parse(payload);
+    ApplyResult result;
+    result.error = {
+        errorCodeFromString(value.at("error_code").get<std::string>()),
+        value.at("error_message").get<std::string>(),
+    };
+    for (const auto& connection : value.at("connections")) {
+        result.connections.push_back({
+            .id = connection.at("id").get<std::string>(),
+            .input_port = connection.at("input_port").get<PortId>(),
+            .output_port = connection.at("output_port").get<PortId>(),
+            .applied_version = connection.at("applied_version").get<std::uint64_t>(),
+        });
+    }
+    return result;
+}
+
+bool desiredStateMatches(
+    const DeviceCommandBatch& batch,
+    const std::vector<AppliedConnection>& actual,
+    ApplyResult& recovered) {
+    recovered = {};
+    for (const auto& command : batch.commands) {
+        const auto existing = std::ranges::find_if(actual, [&command](const auto& connection) {
+            return connection.id == command.id;
+        });
+        if (command.operation == ConnectionOperation::kRemove) {
+            if (existing != actual.end()) {
+                return false;
+            }
+            continue;
+        }
+        if (existing == actual.end() || existing->input_port != command.input_port ||
+            existing->output_port != command.output_port ||
+            existing->applied_version < command.desired_version) {
+            return false;
+        }
+        recovered.connections.push_back(*existing);
+    }
+    return true;
+}
+
 std::string statePayload(const std::map<std::string, std::string>& fields) {
     return nlohmann::json(fields).dump();
 }
@@ -61,7 +122,8 @@ void SyncdService::initialize() {
 
 bool SyncdService::processOne(
     const std::string& consumer_name,
-    const std::function<void()>& before_ack) {
+    const std::function<void()>& before_ack,
+    const std::function<void(std::string_view)>& after_phase) {
     auto messages = device_db_.claimPending(
         std::string(redis::kDeviceCommands),
         std::string(kConsumerGroup),
@@ -81,29 +143,90 @@ bool SyncdService::processOne(
         acknowledge(message.id);
         return true;
     }
-    if (isStaleVersion(message.event)) {
-        markProcessed(message.event, false);
-        acknowledge(message.id);
-        return true;
-    }
-
-    ApplyResult result;
     DeviceCommandBatch batch;
     try {
         batch = decodeDeviceCommand(message.event.payload);
-        result = device_->applyConnections(batch.commands, batch.options);
+        if (isStaleVersion(message.event, batch)) {
+            markProcessed(message.event, batch, false);
+            acknowledge(message.id);
+            return true;
+        }
     } catch (const std::exception& error) {
-        result.error = {ErrorCode::kProtocolMalformed, error.what()};
+        ApplyResult malformed;
+        malformed.error = {ErrorCode::kProtocolMalformed, error.what()};
+        device_db_.putHash(
+            redis::deviceApplyResultKey(message.event.event_id),
+            {{"payload", durableResultPayload(malformed)}});
     }
 
-    publishState(message.event, batch, result);
-    static_cast<void>(counters_db_.incrementHashField(
-        redis::deviceCountersKey(message.event.device), "device_apply_total"));
-    static_cast<void>(counters_db_.incrementHashField(
+    const auto result_key = redis::deviceApplyResultKey(message.event.event_id);
+    auto stored_result = device_db_.getHash(result_key);
+    if (stored_result.empty()) {
+        const auto attempt_key = redis::deviceApplyAttemptKey(message.event.event_id);
+        const bool recovering_apply = !device_db_.getHash(attempt_key).empty();
+        device_db_.putHash(
+            attempt_key,
+            {
+                {"command_id", message.event.event_id},
+                {"device", message.event.device},
+                {"started_at_ns", std::to_string(timestampNowNs())},
+            });
+        ApplyResult result;
+        try {
+            const auto device_info = device_->getDeviceInfo();
+            if (device_info.name != message.event.device) {
+                result.error = {
+                    ErrorCode::kDeviceNotReady,
+                    "command device does not match the connected device backend",
+                };
+            } else if (
+                !recovering_apply ||
+                !desiredStateMatches(batch, device_->getConnections(), result)) {
+                result = device_->applyConnections(batch.commands, batch.options);
+            }
+        } catch (const std::exception& error) {
+            result.error = {ErrorCode::kProtocolMalformed, error.what()};
+        }
+        if (after_phase) {
+            after_phase("device-apply");
+        }
+        device_db_.putHash(result_key, {{"payload", durableResultPayload(result)}});
+        stored_result = device_db_.getHash(result_key);
+    }
+    const auto result_payload = stored_result.find("payload");
+    if (result_payload == stored_result.end()) {
+        throw std::runtime_error("durable device apply result is missing payload");
+    }
+    const auto result = decodeDurableResult(result_payload->second);
+    if (after_phase) {
+        after_phase("apply-result");
+    }
+
+    const auto active_delta = publishState(message.event, batch, result);
+    if (after_phase) {
+        after_phase("state");
+    }
+    const std::map<std::string, long long> counter_increments{
+        {"device_apply_total", 1},
+        {result.ok() ? "device_apply_success_total" : "device_apply_failure_total", 1},
+        {"active_connections", active_delta},
+    };
+    static_cast<void>(counters_db_.incrementHashFieldsOnce(
+        redis::syncdCountersPublicationKey(message.event.event_id),
+        {{"command_id", message.event.event_id}},
         redis::deviceCountersKey(message.event.device),
-        result.ok() ? "device_apply_success_total" : "device_apply_failure_total"));
-    publishResult(message.event, result);
-    markProcessed(message.event, result.ok());
+        counter_increments));
+    if (after_phase) {
+        after_phase("counters");
+    }
+    publishResult(message.event, batch, result);
+    if (after_phase) {
+        after_phase("result");
+    }
+    markProcessed(message.event, batch, result.ok());
+    if (after_phase) {
+        after_phase("processed");
+    }
     if (before_ack) {
         before_ack();
     }
@@ -115,17 +238,23 @@ bool SyncdService::isAlreadyProcessed(const redis::EventEnvelope& command_event)
     return !device_db_.getHash(redis::processedDeviceCommandKey(command_event.event_id)).empty();
 }
 
-bool SyncdService::isStaleVersion(const redis::EventEnvelope& command_event) {
-    const auto version = device_db_.getHash(
-        redis::syncdConnectionVersionKey(command_event.device, command_event.resource_id));
-    const auto last = version.find("last_successful_version");
-    return last != version.end() && command_event.desired_version <= std::stoull(last->second);
+bool SyncdService::isStaleVersion(
+    const redis::EventEnvelope& command_event,
+    const DeviceCommandBatch& batch) {
+    return std::ranges::all_of(batch.commands, [this, &command_event](const auto& command) {
+        const auto version = device_db_.getHash(
+            redis::syncdConnectionVersionKey(command_event.device, command.id));
+        const auto last = version.find("last_successful_version");
+        return last != version.end() && command.desired_version <= std::stoull(last->second);
+    });
 }
 
 void SyncdService::markProcessed(
     const redis::EventEnvelope& command_event,
+    const DeviceCommandBatch& batch,
     bool applied) {
-    device_db_.putHash(
+    std::vector<std::pair<std::string, std::map<std::string, std::string>>> hashes;
+    hashes.push_back({
         redis::processedDeviceCommandKey(command_event.event_id),
         {
             {"command_id", command_event.event_id},
@@ -134,17 +263,21 @@ void SyncdService::markProcessed(
             {"desired_version", std::to_string(command_event.desired_version)},
             {"processed_at_ns", std::to_string(timestampNowNs())},
             {"applied", applied ? "true" : "false"},
-        });
+        }});
     if (applied) {
-        device_db_.putHash(
-            redis::syncdConnectionVersionKey(
-                command_event.device, command_event.resource_id),
-            {
-                {"last_successful_version", std::to_string(command_event.desired_version)},
-                {"last_command_id", command_event.event_id},
-                {"operation", command_event.operation},
-            });
+        for (const auto& command : batch.commands) {
+            hashes.push_back({
+                redis::syncdConnectionVersionKey(command_event.device, command.id),
+                {
+                    {"last_successful_version", std::to_string(command.desired_version)},
+                    {"last_command_id", command_event.event_id},
+                    {"operation", command.operation == ConnectionOperation::kRemove
+                                      ? "REMOVE"
+                                      : "UPSERT"},
+                }});
+        }
     }
+    device_db_.putHashesAtomically(hashes);
 }
 
 void SyncdService::acknowledge(const std::string& message_id) {
@@ -155,16 +288,27 @@ void SyncdService::acknowledge(const std::string& message_id) {
     }
 }
 
-void SyncdService::publishState(
+long long SyncdService::publishState(
     const redis::EventEnvelope& command_event,
     const DeviceCommandBatch& batch,
     const ApplyResult& result) {
+    long long active_delta = 0;
     for (const auto& command : batch.commands) {
+        const auto publication_key =
+            redis::syncdStatePublicationKey(command_event.event_id, command.id);
+        const auto published = state_db_.getHash(publication_key);
+        if (!published.empty()) {
+            active_delta += std::stoll(published.at("active_delta"));
+            continue;
+        }
         const auto state_key = redis::connectionStateKey(command_event.device, command.id);
         const auto previous_state = state_db_.getHash(state_key);
-        const auto previous_status = previous_state.find("apply_status");
-        const bool was_active = previous_status != previous_state.end() &&
-                                previous_status->second == "ACTIVE";
+        const auto actual_present = previous_state.find("actual_present");
+        const auto applied_version = previous_state.find("applied_version");
+        const bool was_active = actual_present != previous_state.end()
+                                    ? actual_present->second == "true"
+                                    : applied_version != previous_state.end() &&
+                                          applied_version->second != "0";
         std::map<std::string, std::string> state;
         std::string operation = "UPSERT";
         if (result.ok() && command.operation == ConnectionOperation::kRemove) {
@@ -178,6 +322,7 @@ void SyncdService::publishState(
                     {"input_port", std::to_string(command.input_port)},
                     {"output_port", std::to_string(command.output_port)},
                     {"applied_version", "0"},
+                    {"actual_present", "false"},
                 };
             }
             state["desired_version"] = std::to_string(command.desired_version);
@@ -199,6 +344,7 @@ void SyncdService::publishState(
                 {"output_port", std::to_string(command.output_port)},
                 {"desired_version", std::to_string(command.desired_version)},
                 {"applied_version", std::to_string(applied->applied_version)},
+                {"actual_present", "true"},
                 {"apply_status", "ACTIVE"},
                 {"last_error_code", std::string(toString(result.error.code))},
                 {"last_error_message", result.error.message},
@@ -217,40 +363,51 @@ void SyncdService::publishState(
             .desired_version = command.desired_version,
             .payload = statePayload(state),
         };
-        state_db_.replaceHashAndAppendEvent(
+        const bool is_active = result.ok()
+                                   ? command.operation != ConnectionOperation::kRemove
+                                   : was_active;
+        const long long command_delta = was_active == is_active ? 0 : (is_active ? 1 : -1);
+        const auto published_now = state_db_.replaceHashAndAppendEventOnce(
+            publication_key,
+            {
+                {"command_id", command_event.event_id},
+                {"connection_id", command.id},
+                {"active_delta", std::to_string(command_delta)},
+            },
             state_key,
             state,
             std::string(redis::kStateEvents),
             state_event);
-        if (result.ok()) {
-            const bool is_active = command.operation != ConnectionOperation::kRemove;
-            if (was_active != is_active) {
-                static_cast<void>(counters_db_.incrementHashField(
-                    redis::deviceCountersKey(command_event.device),
-                    "active_connections",
-                    is_active ? 1 : -1));
-            }
-        }
+        active_delta += published_now
+                            ? command_delta
+                            : std::stoll(state_db_.getHash(publication_key).at("active_delta"));
     }
+    return active_delta;
 }
 
 void SyncdService::publishResult(
     const redis::EventEnvelope& command_event,
+    const DeviceCommandBatch& batch,
     const ApplyResult& result) {
-    redis::EventEnvelope result_event{
-        .event_schema_version = 1,
-        .event_id = command_event.event_id + ":result",
-        .request_id = command_event.request_id,
-        .timestamp_ns = timestampNowNs(),
-        .device = command_event.device,
-        .resource_type = command_event.resource_type,
-        .resource_id = command_event.resource_id,
-        .operation = "APPLY_RESULT",
-        .desired_version = command_event.desired_version,
-        .payload = resultPayload(result),
-    };
-    static_cast<void>(
-        device_db_.appendEvent(std::string(redis::kDeviceResults), result_event));
+    for (const auto& command : batch.commands) {
+        redis::EventEnvelope result_event{
+            .event_schema_version = 1,
+            .event_id = command_event.event_id + ":result:" + command.id,
+            .request_id = command_event.request_id,
+            .timestamp_ns = timestampNowNs(),
+            .device = command_event.device,
+            .resource_type = "connection",
+            .resource_id = command.id,
+            .operation = "APPLY_RESULT",
+            .desired_version = command.desired_version,
+            .payload = resultPayload(result),
+        };
+        static_cast<void>(device_db_.appendEventOnce(
+            redis::syncdResultPublicationKey(command_event.event_id, command.id),
+            {{"command_id", command_event.event_id}, {"connection_id", command.id}},
+            std::string(redis::kDeviceResults),
+            result_event));
+    }
 }
 
 }  // namespace ocs

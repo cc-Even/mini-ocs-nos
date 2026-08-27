@@ -62,6 +62,32 @@ inline constexpr std::string_view kFaultCommands = "OCS_FAULT_COMMANDS";
     return "OCS_PROCESSED_DEVICE_COMMAND|" + std::string(command_id);
 }
 
+[[nodiscard]] inline std::string deviceApplyAttemptKey(std::string_view command_id) {
+    return "OCS_DEVICE_APPLY_ATTEMPT|" + std::string(command_id);
+}
+
+[[nodiscard]] inline std::string deviceApplyResultKey(std::string_view command_id) {
+    return "OCS_DEVICE_APPLY_RESULT|" + std::string(command_id);
+}
+
+[[nodiscard]] inline std::string syncdStatePublicationKey(
+    std::string_view command_id,
+    std::string_view connection_id) {
+    return "OCS_SYNCD_STATE_PUBLISHED|" + std::string(command_id) + "|" +
+           std::string(connection_id);
+}
+
+[[nodiscard]] inline std::string syncdCountersPublicationKey(std::string_view command_id) {
+    return "OCS_SYNCD_COUNTERS_PUBLISHED|" + std::string(command_id);
+}
+
+[[nodiscard]] inline std::string syncdResultPublicationKey(
+    std::string_view command_id,
+    std::string_view connection_id) {
+    return "OCS_SYNCD_RESULT_PUBLISHED|" + std::string(command_id) + "|" +
+           std::string(connection_id);
+}
+
 [[nodiscard]] inline std::string connectionStateKey(
     std::string_view device,
     std::string_view connection_id) {

@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ocs::redis {
@@ -62,6 +63,25 @@ public:
         const std::map<std::string, std::string>& fields,
         const std::string& stream,
         const EventEnvelope& event);
+    [[nodiscard]] bool replaceHashAndAppendEventOnce(
+        const std::string& marker_key,
+        const std::map<std::string, std::string>& marker_fields,
+        const std::string& key,
+        const std::map<std::string, std::string>& fields,
+        const std::string& stream,
+        const EventEnvelope& event);
+    [[nodiscard]] bool appendEventOnce(
+        const std::string& marker_key,
+        const std::map<std::string, std::string>& marker_fields,
+        const std::string& stream,
+        const EventEnvelope& event);
+    [[nodiscard]] bool incrementHashFieldsOnce(
+        const std::string& marker_key,
+        const std::map<std::string, std::string>& marker_fields,
+        const std::string& key,
+        const std::map<std::string, long long>& increments);
+    void putHashesAtomically(
+        const std::vector<std::pair<std::string, std::map<std::string, std::string>>>& hashes);
 
     [[nodiscard]] std::string appendEvent(const std::string& stream, const EventEnvelope& event);
     void createConsumerGroup(

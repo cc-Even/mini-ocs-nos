@@ -16,6 +16,7 @@ from gnmi_server.redis_keys import (
     DEVICE_RESULTS,
     STATE_DB,
     STATE_EVENTS,
+    device_config_key,
     device_counters_key,
 )
 from gnmi_server.redis_repository import RedisConfigRepository, RedisSettings, create_redis_client
@@ -65,6 +66,15 @@ async def test_crashed_syncd_claims_pending_without_duplicate_side_effects(
     }
     for client in clients.values():
         await client.flushdb()
+    await clients[CONFIG_DB].hset(
+        device_config_key("ocs0"),
+        mapping={
+            "name": "ocs0",
+            "input_port_count": "16",
+            "output_port_count": "16",
+            "admin_status": "ENABLED",
+        },
+    )
 
     service = GnmiService(
         SetTransaction(RedisConfigRepository(settings)),

@@ -198,6 +198,78 @@ TEST_F(OrchestratorIntegrationTest, ConfigEventReachesActiveThroughStandaloneHws
         device_db_->pendingCount(std::string(ocs::redis::kDeviceResults), "ocs-orch"), 0);
 }
 
+TEST_F(OrchestratorIntegrationTest, PreservesAtomicOutputSwapAsOneDeviceBatch) {
+    const auto initial_event = [](std::string id, ocs::PortId input, ocs::PortId output) {
+        return ocs::redis::EventEnvelope{
+            .event_schema_version = 1,
+            .event_id = "event-swap-initial-" + id,
+            .request_id = "request-swap-initial-" + id,
+            .timestamp_ns = 1780000000000000010ULL,
+            .device = "ocs0",
+            .resource_type = "connection",
+            .resource_id = id,
+            .operation = "UPSERT",
+            .desired_version = 1,
+            .payload = "{\"input_port\":" + std::to_string(input) +
+                       ",\"output_port\":" + std::to_string(output) + "}",
+        };
+    };
+    applyConfigEvent(initial_event("swap-a", 1, 9));
+    applyConfigEvent(initial_event("swap-b", 2, 10));
+
+    const ocs::DeviceCommandBatch swap{
+        .commands = {
+            {
+                .id = "swap-a",
+                .input_port = 1,
+                .output_port = 10,
+                .desired_version = 2,
+            },
+            {
+                .id = "swap-b",
+                .input_port = 2,
+                .output_port = 9,
+                .desired_version = 2,
+            },
+        },
+        .options = {},
+    };
+    const ocs::redis::EventEnvelope batch_event{
+        .event_schema_version = 1,
+        .event_id = "event-swap-batch-002",
+        .request_id = "request-swap-batch-002",
+        .timestamp_ns = 1780000000000000012ULL,
+        .device = "ocs0",
+        .resource_type = "connection-batch",
+        .resource_id = "request-swap-batch-002",
+        .operation = "APPLY_BATCH",
+        .desired_version = 2,
+        .payload = ocs::encodeDeviceCommand(swap),
+    };
+    static_cast<void>(config_db_->appendEvent(
+        std::string(ocs::redis::kConfigEvents), batch_event));
+
+    ASSERT_TRUE(orch_->processConfigOne("orch-test-swap"));
+    ASSERT_TRUE(syncd_->processOne("syncd-test-swap"));
+    ASSERT_TRUE(orch_->processResultOne("orch-test-swap-result"));
+    ASSERT_TRUE(orch_->processResultOne("orch-test-swap-result"));
+
+    const auto swap_a =
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "swap-a"));
+    const auto swap_b =
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "swap-b"));
+    EXPECT_EQ(swap_a.at("output_port"), "10");
+    EXPECT_EQ(swap_b.at("output_port"), "9");
+    EXPECT_EQ(swap_a.at("applied_version"), "2");
+    EXPECT_EQ(swap_b.at("applied_version"), "2");
+    EXPECT_EQ(
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "swap-a")).at("apply_status"),
+        "ACTIVE");
+    EXPECT_EQ(
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "swap-b")).at("apply_status"),
+        "ACTIVE");
+}
+
 TEST_F(OrchestratorIntegrationTest, CoalescesConsecutiveVersionsWhileApplyIsOutstanding) {
     const ocs::redis::EventEnvelope first{
         .event_schema_version = 1,

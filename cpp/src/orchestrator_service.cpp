@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace ocs {
 namespace {
@@ -82,6 +83,25 @@ ConnectionCommand decodeConfigEvent(const redis::EventEnvelope& event) {
     command.input_port = decodePort(payload, "input_port");
     command.output_port = decodePort(payload, "output_port");
     return command;
+}
+
+DeviceCommandBatch decodeConfigBatchEvent(const redis::EventEnvelope& event) {
+    if (event.resource_type == "connection") {
+        return {.commands = {decodeConfigEvent(event)}, .options = {}};
+    }
+    if (event.resource_type != "connection-batch" || event.operation != "APPLY_BATCH") {
+        throw std::invalid_argument("orch only supports connection configuration events");
+    }
+    if (event.desired_version == 0) {
+        throw std::invalid_argument("connection batch desired version must be positive");
+    }
+    auto batch = decodeDeviceCommand(event.payload);
+    for (const auto& command : batch.commands) {
+        if (command.desired_version != event.desired_version) {
+            throw std::invalid_argument("connection batch has inconsistent desired versions");
+        }
+    }
+    return batch;
 }
 
 PortId snapshotPort(
@@ -180,11 +200,26 @@ bool OrchestratorService::processConfigOne(const std::string& consumer_name) {
     }
 
     const auto& message = messages.front();
-    const auto app_key =
-        redis::connectionAppKey(message.event.device, message.event.resource_id);
-    const auto existing_application = appl_db_.getHash(app_key);
-    const auto previous_version = currentVersion(existing_application);
-    if (message.event.desired_version <= previous_version) {
+    auto batch = decodeConfigBatchEvent(message.event);
+    std::vector<ConnectionCommand> commands;
+    commands.reserve(batch.commands.size());
+    for (auto command : batch.commands) {
+        const auto app_key = redis::connectionAppKey(message.event.device, command.id);
+        const auto existing_application = appl_db_.getHash(app_key);
+        const auto previous_version = currentVersion(existing_application);
+        if (command.desired_version <= previous_version) {
+            continue;
+        }
+        if (command.operation == ConnectionOperation::kRemove && existing_application.empty()) {
+            continue;
+        }
+        if (message.event.resource_type == "connection" &&
+            command.desired_version - previous_version > 1) {
+            command = loadDesiredSnapshot(config_db_, message.event);
+        }
+        commands.push_back(std::move(command));
+    }
+    if (commands.empty()) {
         const auto acknowledged = config_db_.acknowledge(
             std::string(redis::kConfigEvents), std::string(kConsumerGroup), message.id);
         if (acknowledged != 1) {
@@ -193,46 +228,45 @@ bool OrchestratorService::processConfigOne(const std::string& consumer_name) {
         return true;
     }
 
-    const auto command = message.event.desired_version - previous_version > 1
-                             ? loadDesiredSnapshot(config_db_, message.event)
-                             : decodeConfigEvent(message.event);
-    const auto device_key = redis::connectionDeviceKey(message.event.device, command.id);
-    const auto status = startApplyTransition(
-        currentStatus(existing_application), command.operation);
     const auto command_id = message.event.event_id + ":command";
-    const auto operation = operationName(command.operation);
+    for (const auto& command : commands) {
+        const auto app_key = redis::connectionAppKey(message.event.device, command.id);
+        const auto device_key = redis::connectionDeviceKey(message.event.device, command.id);
+        const auto existing_application = appl_db_.getHash(app_key);
+        const auto status = startApplyTransition(
+            currentStatus(existing_application), command.operation);
+        const std::map<std::string, std::string> application{
+            {"device", message.event.device},
+            {"id", command.id},
+            {"input_port", std::to_string(command.input_port)},
+            {"output_port", std::to_string(command.output_port)},
+            {"desired_version", std::to_string(command.desired_version)},
+            {"apply_status", std::string(toString(status))},
+            {"operation", operationName(command.operation)},
+            {"request_id", message.event.request_id},
+            {"event_id", message.event.event_id},
+            {"command_id", command_id},
+            {"last_error_code", ""},
+            {"last_error_message", ""},
+        };
+        appl_db_.putHash(app_key, application);
+        device_db_.putHash(device_key, application);
+    }
 
-    const std::map<std::string, std::string> application{
-        {"device", message.event.device},
-        {"id", command.id},
-        {"input_port", std::to_string(command.input_port)},
-        {"output_port", std::to_string(command.output_port)},
-        {"desired_version", std::to_string(command.desired_version)},
-        {"apply_status", std::string(toString(status))},
-        {"operation", operation},
-        {"request_id", message.event.request_id},
-        {"event_id", message.event.event_id},
-        {"command_id", command_id},
-        {"last_error_code", ""},
-        {"last_error_message", ""},
-    };
-    appl_db_.putHash(app_key, application);
-    device_db_.putHash(device_key, application);
-
-    const DeviceCommandBatch batch{
-        .commands = {command},
-        .options = {},
-    };
+    batch.commands = std::move(commands);
     const redis::EventEnvelope command_event{
         .event_schema_version = 1,
         .event_id = command_id,
         .request_id = message.event.request_id,
         .timestamp_ns = timestampNowNs(),
         .device = message.event.device,
-        .resource_type = message.event.resource_type,
-        .resource_id = message.event.resource_id,
-        .operation = operation,
-        .desired_version = command.desired_version,
+        .resource_type = batch.commands.size() == 1 ? "connection" : "connection-batch",
+        .resource_id = batch.commands.size() == 1 ? batch.commands.front().id
+                                                  : message.event.request_id,
+        .operation = batch.commands.size() == 1
+                         ? operationName(batch.commands.front().operation)
+                         : "APPLY_BATCH",
+        .desired_version = message.event.desired_version,
         .payload = encodeDeviceCommand(batch),
     };
     static_cast<void>(
