@@ -18,11 +18,14 @@ DEFAULT_LISTEN_ADDRESS: Final = "127.0.0.1:50051"
 DEFAULT_SHUTDOWN_GRACE_SECONDS: Final = 5.0
 
 
-def create_server(listen_address: str) -> tuple[grpc.aio.Server, int]:
+def create_server(
+    listen_address: str,
+    service: GnmiService | None = None,
+) -> tuple[grpc.aio.Server, int]:
     """Create a configured server and return its resolved listening port."""
 
     server = grpc.aio.server()
-    gnmi_pb2_grpc.add_gNMIServicer_to_server(GnmiService(), server)
+    gnmi_pb2_grpc.add_gNMIServicer_to_server(service or GnmiService(), server)
     bound_port = server.add_insecure_port(listen_address)
     if bound_port == 0:
         raise RuntimeError(f"failed to bind gNMI server to {listen_address}")
@@ -36,7 +39,8 @@ async def serve(
     """Serve until SIGINT or SIGTERM, then perform a bounded graceful stop."""
 
     logger = configure_logging("gnmi-server")
-    server, bound_port = create_server(listen_address)
+    service = GnmiService()
+    server, bound_port = create_server(listen_address, service)
     stop_requested = asyncio.Event()
     loop = asyncio.get_running_loop()
     installed_signals: list[signal.Signals] = []
@@ -56,6 +60,7 @@ async def serve(
         await stop_requested.wait()
     finally:
         await server.stop(shutdown_grace_seconds)
+        await service.close()
         for signum in installed_signals:
             loop.remove_signal_handler(signum)
         logger.info("gNMI server stopped", extra={"operation": "STOP", "result": "OK"})

@@ -3,12 +3,19 @@ import pytest
 from gnmi_server.path_parser import protobuf_path
 from gnmi_server.proto import gnmi_pb2, gnmi_pb2_grpc
 from gnmi_server.server import create_server
-from gnmi_server.service import GNMI_VERSION, MODEL_NAME, MODEL_ORGANIZATION, MODEL_VERSION
+from gnmi_server.service import (
+    GNMI_VERSION,
+    MODEL_NAME,
+    MODEL_ORGANIZATION,
+    MODEL_VERSION,
+    GnmiService,
+)
 
 
 @pytest.fixture
 async def gnmi_stub():
-    server, port = create_server("127.0.0.1:0")
+    service = GnmiService()
+    server, port = create_server("127.0.0.1:0", service)
     await server.start()
     channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
     try:
@@ -16,6 +23,7 @@ async def gnmi_stub():
     finally:
         await channel.close()
         await server.stop(0.5)
+        await service.close()
 
 
 async def test_capabilities_are_served_over_official_gnmi_rpc(gnmi_stub) -> None:
@@ -50,7 +58,7 @@ async def test_valid_get_is_explicitly_deferred(gnmi_stub) -> None:
         await gnmi_stub.Get(request, timeout=1.0)
 
     assert raised.value.code() is grpc.StatusCode.UNIMPLEMENTED
-    assert raised.value.details() == "Get is not implemented in Iteration 30"
+    assert raised.value.details() == "Get is not implemented in Iteration 31"
 
 
 async def test_invalid_set_path_maps_to_invalid_argument(gnmi_stub) -> None:

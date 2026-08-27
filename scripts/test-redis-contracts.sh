@@ -20,3 +20,7 @@ test "$(docker compose exec -T redis redis-cli ping)" = "PONG"
 OCS_REDIS_SOCKET="${REDIS_RUNTIME_DIR}/redis.sock" \
 ctest --test-dir build/dev --output-on-failure \
     -R "RedisContractTest|SyncdIntegrationTest|OrchestratorIntegrationTest"
+
+OCS_REDIS_SOCKET="${REDIS_RUNTIME_DIR}/redis.sock" \
+UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/mini-ocs-uv-cache}" \
+uv run --frozen pytest python/tests/integration --no-header -q

@@ -11,6 +11,8 @@ from gnmi_server import __version__
 from gnmi_server.errors import InvalidArgumentError, abort_rpc
 from gnmi_server.path_parser import parse_paths
 from gnmi_server.proto import gnmi_pb2, gnmi_pb2_grpc
+from gnmi_server.redis_repository import RedisConfigRepository
+from gnmi_server.set_transaction import SetOperationKind, SetTransaction
 
 MODEL_NAME: Final = "mini-ocs-native"
 MODEL_ORGANIZATION: Final = "mini-ocs-nos"
@@ -19,7 +21,13 @@ GNMI_VERSION: Final = gnmi_pb2.DESCRIPTOR.GetOptions().Extensions[gnmi_pb2.gnmi_
 
 
 class GnmiService(gnmi_pb2_grpc.gNMIServicer):
-    """Iteration-30 gNMI surface with Capabilities and boundary validation."""
+    """gNMI management surface with atomic desired-state Set handling."""
+
+    def __init__(self, set_transaction: SetTransaction | None = None) -> None:
+        self._set_transaction = set_transaction or SetTransaction(RedisConfigRepository())
+
+    async def close(self) -> None:
+        await self._set_transaction.close()
 
     async def Capabilities(
         self,
@@ -50,24 +58,35 @@ class GnmiService(gnmi_pb2_grpc.gNMIServicer):
             parse_paths(request.path, prefix=request.prefix)
         except Exception as error:
             await abort_rpc(context, error)
-        await context.abort(grpc.StatusCode.UNIMPLEMENTED, "Get is not implemented in Iteration 30")
+        await context.abort(grpc.StatusCode.UNIMPLEMENTED, "Get is not implemented in Iteration 31")
 
     async def Set(
         self,
         request: gnmi_pb2.SetRequest,
         context: grpc.aio.ServicerContext,
     ) -> gnmi_pb2.SetResponse:
-        paths = [*request.delete]
-        paths.extend(update.path for update in request.replace)
-        paths.extend(update.path for update in request.update)
-        paths.extend(update.path for update in request.union_replace)
         try:
-            if not paths:
-                raise InvalidArgumentError("SetRequest requires at least one operation")
-            parse_paths(paths, prefix=request.prefix)
+            result = await self._set_transaction.apply(request)
         except Exception as error:
             await abort_rpc(context, error)
-        await context.abort(grpc.StatusCode.UNIMPLEMENTED, "Set is not implemented in Iteration 30")
+            raise AssertionError("gRPC abort returned unexpectedly") from error
+
+        operation_codes = {
+            SetOperationKind.DELETE: gnmi_pb2.UpdateResult.DELETE,
+            SetOperationKind.REPLACE: gnmi_pb2.UpdateResult.REPLACE,
+            SetOperationKind.UPDATE: gnmi_pb2.UpdateResult.UPDATE,
+        }
+        return gnmi_pb2.SetResponse(
+            prefix=request.prefix,
+            response=[
+                gnmi_pb2.UpdateResult(
+                    path=operation.response_path,
+                    op=operation_codes[operation.kind],
+                )
+                for operation in result.operations
+            ],
+            timestamp=result.timestamp_ns,
+        )
 
     async def Subscribe(
         self,
@@ -77,6 +96,6 @@ class GnmiService(gnmi_pb2_grpc.gNMIServicer):
         del request_iterator
         await context.abort(
             grpc.StatusCode.UNIMPLEMENTED,
-            "Subscribe is not implemented in Iteration 30",
+            "Subscribe is not implemented in Iteration 31",
         )
         yield gnmi_pb2.SubscribeResponse()

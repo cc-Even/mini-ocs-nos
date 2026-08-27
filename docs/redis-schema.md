@@ -40,6 +40,27 @@ C++ types. Unsupported schema versions and missing identity fields are rejected
 before append. Consumer groups are created idempotently, delivery creates a
 pending entry, and consumers ACK only after successful processing.
 
+## gNMI configuration transaction
+
+The Python management service reads the complete desired connection snapshot
+for one device and applies gNMI operations in delete, replace, then update order.
+It validates the final candidate, so an order-independent swap is valid while
+any final input/output conflict rejects the entire request.
+
+`OCS_CONFIG_REVISION|device` is a device-wide monotonic integer and is also used
+as the new `desired_version` for every connection changed by one SetRequest.
+This preserves monotonic resource versions across delete and later recreation.
+The writer watches the revision and uses bounded retries to prevent concurrent
+requests from losing updates.
+
+One CONFIG_DB `MULTI/EXEC` replaces or deletes all affected
+`OCS_CONNECTION|device|id` hashes, advances the revision, and appends a
+compatible `UPSERT` or `REMOVE` event for each final resource change to
+`OCS_CONFIG_EVENTS`. All events from one request share its request ID, revision,
+and timestamp. A validation failure executes no Redis write, and a successful
+SetResponse confirms only this atomic desired-state persistence—not hardware
+application.
+
 Integration tests keep Redis on an internal Docker network with protected mode
 enabled and no published TCP port. A random temporary Unix socket is mounted for
 the test process and removed together with all Compose resources after the run.
