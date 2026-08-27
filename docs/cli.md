@@ -20,10 +20,16 @@ ocsctl port list ocs0
 ocsctl connection list ocs0
 ocsctl alarm list ocs0
 ocsctl counters show ocs0
+ocsctl diagnostics show ocs0
 ocsctl get '/ocs/devices/device[name=ocs0]/connections/connection[id=conn-001]/state'
 ```
 
 Human output is the default. Add `--json` as a global option for stable JSON.
+
+`diagnostics show` returns device health, desired and confirmed-active counts,
+drift, active alarms, pending entries for each reliable stream, and freshness-
+bounded online status for gNMI, orch, syncd, and standalone hwsim. It reaches
+Redis only through the gNMI server; `ocsctl` retains no Redis dependency.
 
 ## Connection changes
 

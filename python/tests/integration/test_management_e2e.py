@@ -218,6 +218,56 @@ async def test_scenarios_a_b_and_h_through_ocsctl_and_gnmi(tmp_path: Path) -> No
             assert counters["active-alarms"] == 0
             assert counters["port-down-total"] == 1
 
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while True:
+            code, stdout, stderr = await _run_cli(
+                target, "diagnostics", "show", "ocs0"
+            )
+            assert code == 0, stderr
+            diagnostics = json.loads(stdout)
+            if (
+                diagnostics["core-services-online"]
+                and diagnostics["stream-pending-total"] == 0
+                and not diagnostics["drift"]
+            ):
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError(f"diagnostics did not converge: {diagnostics}")
+            await asyncio.sleep(0.05)
+        assert diagnostics["device-health"] == "READY"
+        assert diagnostics["desired-connections"] == 3
+        assert diagnostics["actual-connections"] == 3
+        assert diagnostics["active-alarms"] == 0
+        assert all(diagnostics["services"].values())
+        assert set(diagnostics["stream-pending"]) == {
+            "config-events",
+            "device-commands",
+            "device-results",
+            "device-retries",
+        }
+        required_counters = {
+            "config-requests-total",
+            "config-rejected-total",
+            "device-apply-total",
+            "device-apply-success-total",
+            "device-apply-failure-total",
+            "device-apply-timeout-total",
+            "reconciliation-total",
+            "reconciliation-success-total",
+            "active-connections",
+            "active-alarms",
+            "last-apply-latency-ms",
+            "max-apply-latency-ms",
+        }
+        assert required_counters <= diagnostics["counters"].keys()
+        assert diagnostics["counters"]["config-requests-total"] == 1
+        assert diagnostics["counters"]["config-rejected-total"] == 0
+        assert diagnostics["counters"]["last-apply-latency-ms"] >= 0
+        assert (
+            diagnostics["counters"]["max-apply-latency-ms"]
+            >= diagnostics["counters"]["last-apply-latency-ms"]
+        )
+
         code, _, stderr = await _run_cli(
             target,
             "connection",
@@ -328,7 +378,11 @@ async def test_scenarios_a_b_and_h_through_ocsctl_and_gnmi(tmp_path: Path) -> No
 
         async with GnmiClient(target, timeout_seconds=5.0) as client:
             assert await client.get("/ocs/devices/device[name=ocs0]/connections") == before_conflict
-            assert await client.get("/ocs/devices/device[name=ocs0]/counters") == counters_before
+            counters_after = await client.get("/ocs/devices/device[name=ocs0]/counters")
+            expected_counters = dict(counters_before)
+            expected_counters["config-requests-total"] += 1
+            expected_counters["config-rejected-total"] += 1
+            assert counters_after == expected_counters
             for connection_id in ("conflict-1", "conflict-2"):
                 with pytest.raises(grpc.aio.AioRpcError) as missing:
                     await client.get(connection_path("ocs0", connection_id, "config"))

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Mapping
 from typing import Any, Final
 
-from redis.exceptions import RedisError
+from redis.exceptions import RedisError, ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from gnmi_server.errors import DeadlineExceededError, DependencyUnavailableError, NotFoundError
@@ -15,7 +16,12 @@ from gnmi_server.proto import gnmi_pb2
 from gnmi_server.redis_keys import (
     ALARM_DB,
     CONFIG_DB,
+    CONFIG_EVENTS,
     COUNTERS_DB,
+    DEVICE_COMMANDS,
+    DEVICE_DB,
+    DEVICE_RESULTS,
+    DEVICE_RETRIES,
     STATE_DB,
     active_alarm_key,
     active_alarm_pattern,
@@ -33,6 +39,7 @@ from gnmi_server.redis_keys import (
     input_port_state_pattern,
     output_port_state_key,
     output_port_state_pattern,
+    service_state_key,
 )
 from gnmi_server.redis_repository import RedisSettings, create_redis_client
 
@@ -50,6 +57,8 @@ _INTEGER_FIELDS: Final = {
     "input_port",
     "input_port_count",
     "last_change_ns",
+    "last_apply_latency_ms",
+    "max_apply_latency_ms",
     "output_port",
     "output_port_count",
     "port_id",
@@ -110,6 +119,7 @@ class RedisGetRepository:
         self._state = create_redis_client(self.settings, STATE_DB)
         self._counters = create_redis_client(self.settings, COUNTERS_DB)
         self._alarm = create_redis_client(self.settings, ALARM_DB)
+        self._device_db = create_redis_client(self.settings, DEVICE_DB)
 
     async def close(self) -> None:
         await asyncio.gather(
@@ -117,6 +127,7 @@ class RedisGetRepository:
             self._state.aclose(),
             self._counters.aclose(),
             self._alarm.aclose(),
+            self._device_db.aclose(),
         )
 
     async def read_many(
@@ -182,6 +193,8 @@ class RedisGetRepository:
             return await self._required_hash(
                 self._counters, device_counters_key(device), f"counters {device!r}"
             )
+        if path.kind is PathKind.DIAGNOSTICS:
+            return await self._diagnostics(device)
         if path.kind is PathKind.ALARMS:
             await self._require_device(device)
             return {"alarm": await self._alarm_list(device)}
@@ -193,6 +206,109 @@ class RedisGetRepository:
                 f"alarm {device!r}/{path.alarm_id!r}",
             )
         raise AssertionError(f"unhandled path kind {path.kind}")
+
+    async def _diagnostics(self, device: str) -> dict[str, Any]:
+        await self._require_device(device)
+        desired: dict[str, dict[str, str]] = {}
+        async for key in self._config.scan_iter(
+            match=connection_config_pattern(device), count=100
+        ):
+            fields = await self._config.hgetall(key)
+            if fields:
+                desired[key.rsplit("|", 1)[1]] = fields
+
+        operational: dict[str, dict[str, str]] = {}
+        async for key in self._state.scan_iter(
+            match=connection_state_pattern(device), count=100
+        ):
+            fields = await self._state.hgetall(key)
+            if fields:
+                operational[key.rsplit("|", 1)[1]] = fields
+
+        def actual_present(fields: dict[str, str]) -> bool:
+            if "actual_present" in fields:
+                return fields["actual_present"] == "true"
+            return fields.get("applied_version", "0") != "0"
+
+        drift = False
+        for connection_id, config in desired.items():
+            state = operational.get(connection_id, {})
+            if (
+                state.get("apply_status") != "ACTIVE"
+                or state.get("desired_version") != config.get("desired_version")
+                or state.get("applied_version") != config.get("desired_version")
+                or state.get("input_port") != config.get("input_port")
+                or state.get("output_port") != config.get("output_port")
+            ):
+                drift = True
+                break
+        if any(
+            connection_id not in desired and actual_present(state)
+            for connection_id, state in operational.items()
+        ):
+            drift = True
+
+        alarm_count = 0
+        async for _ in self._alarm.scan_iter(match=active_alarm_pattern(device), count=100):
+            alarm_count += 1
+        device_state = await self._state.hgetall(device_state_key(device))
+        counters = await self._counters.hgetall(device_counters_key(device))
+        pending = {
+            "config-events": await self._pending_count(
+                self._config, CONFIG_EVENTS, "ocs-orch"
+            ),
+            "device-commands": await self._pending_count(
+                self._device_db, DEVICE_COMMANDS, "ocs-syncd"
+            ),
+            "device-results": await self._pending_count(
+                self._device_db, DEVICE_RESULTS, "ocs-orch"
+            ),
+            "device-retries": await self._pending_count(
+                self._device_db, DEVICE_RETRIES, "ocs-orch-retry"
+            ),
+        }
+        now_ns = time.time_ns()
+
+        async def online(service: str) -> bool:
+            state = await self._state.hgetall(service_state_key(service))
+            try:
+                last_seen_ns = int(state.get("last_seen_ns", "0"))
+            except ValueError:
+                return False
+            return (
+                state.get("status") == "ONLINE"
+                and 0 <= now_ns - last_seen_ns <= 2_000_000_000
+            )
+
+        services = {
+            "gnmi-server": True,
+            "ocs-orch": await online("ocs-orch"),
+            "ocs-syncd": await online("ocs-syncd"),
+            "ocs-hwsim": await online("ocs-hwsim"),
+        }
+        return {
+            "device": device,
+            "device-health": device_state.get("oper_status", "UNKNOWN"),
+            "desired-connections": len(desired),
+            "actual-connections": sum(actual_present(state) for state in operational.values()),
+            "drift": drift,
+            "active-alarms": alarm_count,
+            "stream-pending": pending,
+            "stream-pending-total": sum(pending.values()),
+            "services": services,
+            "core-services-online": all(services.values()),
+            "counters": _native_fields(counters),
+        }
+
+    @staticmethod
+    async def _pending_count(client, stream: str, group: str) -> int:
+        try:
+            summary = await client.xpending(stream, group)
+        except ResponseError as error:
+            if "NOGROUP" in str(error):
+                return 0
+            raise
+        return int(summary["pending"])
 
     async def _device(self, device: str, request_type: int) -> dict[str, Any]:
         result: dict[str, Any] = {"name": device}

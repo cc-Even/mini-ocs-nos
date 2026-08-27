@@ -44,6 +44,7 @@ class PathKind(StrEnum):
     ALARMS = "alarms"
     ALARM = "alarm"
     COUNTERS = "counters"
+    DIAGNOSTICS = "diagnostics"
 
 
 @dataclass(frozen=True)
@@ -145,6 +146,9 @@ def _canonical_path(
     if branch == "counters" and len(elements) == 4:
         _expect_element(elements[3], "counters")
         return NativePath(PathKind.COUNTERS, **base)
+    if branch == "diagnostics" and len(elements) == 4:
+        _expect_element(elements[3], "diagnostics")
+        return NativePath(PathKind.DIAGNOSTICS, **base)
     if branch == "ports":
         _expect_element(elements[3], "ports")
         if len(elements) == 4:

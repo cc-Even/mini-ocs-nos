@@ -55,6 +55,9 @@ public:
     [[nodiscard]] bool putHashIfAbsent(
         const std::string& key,
         const std::map<std::string, std::string>& fields);
+    void ensureHashFields(
+        const std::string& key,
+        const std::map<std::string, std::string>& fields);
     [[nodiscard]] std::map<std::string, std::string> getHash(const std::string& key);
     [[nodiscard]] std::vector<std::string> scanKeys(
         const std::string& pattern,
@@ -86,6 +89,12 @@ public:
         const std::map<std::string, std::string>& marker_fields,
         const std::string& key,
         const std::map<std::string, long long>& increments);
+    [[nodiscard]] bool recordApplyCountersOnce(
+        const std::string& marker_key,
+        const std::map<std::string, std::string>& marker_fields,
+        const std::string& key,
+        const std::map<std::string, long long>& increments,
+        long long latency_ms);
     [[nodiscard]] bool putVersionedHashesAtomicallyIfMarkerAbsent(
         const std::string& marker_key,
         const std::map<std::string, std::string>& marker_fields,

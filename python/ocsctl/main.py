@@ -18,11 +18,13 @@ port_app = typer.Typer(no_args_is_help=True)
 connection_app = typer.Typer(no_args_is_help=True)
 alarm_app = typer.Typer(no_args_is_help=True)
 counters_app = typer.Typer(no_args_is_help=True)
+diagnostics_app = typer.Typer(no_args_is_help=True)
 app.add_typer(device_app, name="device")
 app.add_typer(port_app, name="port")
 app.add_typer(connection_app, name="connection")
 app.add_typer(alarm_app, name="alarm")
 app.add_typer(counters_app, name="counters")
+app.add_typer(diagnostics_app, name="diagnostics")
 
 
 @dataclass(frozen=True)
@@ -257,6 +259,17 @@ def alarm_list(context: typer.Context, device: str) -> None:
 def counters_show(context: typer.Context, device: str) -> None:
     settings: CliSettings = context.obj
     _emit(_run(_get(settings, f"/ocs/devices/device[name={device}]/counters")), settings)
+
+
+@diagnostics_app.command("show")
+def diagnostics_show(context: typer.Context, device: str) -> None:
+    """Show bounded health, convergence, alarm, pending, and service status."""
+
+    settings: CliSettings = context.obj
+    _emit(
+        _run(_get(settings, f"/ocs/devices/device[name={device}]/diagnostics")),
+        settings,
+    )
 
 
 @app.command("get")

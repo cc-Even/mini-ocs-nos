@@ -63,6 +63,50 @@ TEST_F(RedisContractTest, ReplacesHashWithoutRetainingOldFields) {
     EXPECT_EQ(config_->getHash(key), replacement);
 }
 
+TEST_F(RedisContractTest, InitializesAndRecordsApplyCountersWithoutDuplicateEffects) {
+    ocs::redis::RedisRepository counters(endpoint_, ocs::redis::LogicalDb::kCounters);
+    counters.flushForTest();
+    const auto key = ocs::redis::deviceCountersKey("ocs0");
+    counters.ensureHashFields(
+        key,
+        {
+            {"device_apply_total", "0"},
+            {"last_apply_latency_ms", "0"},
+            {"max_apply_latency_ms", "0"},
+        });
+
+    EXPECT_TRUE(counters.recordApplyCountersOnce(
+        "OCS_TEST_APPLY_COUNTERS|first",
+        {{"command_id", "first"}},
+        key,
+        {{"device_apply_total", 1}},
+        12));
+    EXPECT_FALSE(counters.recordApplyCountersOnce(
+        "OCS_TEST_APPLY_COUNTERS|first",
+        {{"command_id", "first"}},
+        key,
+        {{"device_apply_total", 1}},
+        99));
+    EXPECT_TRUE(counters.recordApplyCountersOnce(
+        "OCS_TEST_APPLY_COUNTERS|second",
+        {{"command_id", "second"}},
+        key,
+        {{"device_apply_total", 1}},
+        5));
+    counters.ensureHashFields(
+        key,
+        {
+            {"device_apply_total", "0"},
+            {"last_apply_latency_ms", "0"},
+            {"max_apply_latency_ms", "0"},
+        });
+
+    const auto values = counters.getHash(key);
+    EXPECT_EQ(values.at("device_apply_total"), "2");
+    EXPECT_EQ(values.at("last_apply_latency_ms"), "5");
+    EXPECT_EQ(values.at("max_apply_latency_ms"), "12");
+}
+
 TEST_F(RedisContractTest, ScansMatchingKeysWithinExplicitResultBound) {
     const auto first = ocs::redis::connectionConfigKey("ocs0", "scan-a");
     const auto second = ocs::redis::connectionConfigKey("ocs0", "scan-b");

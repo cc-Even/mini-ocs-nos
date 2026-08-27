@@ -26,6 +26,7 @@ _STATE_ONLY_KINDS: Final = {
     PathKind.ALARMS,
     PathKind.ALARM,
     PathKind.COUNTERS,
+    PathKind.DIAGNOSTICS,
 }
 
 

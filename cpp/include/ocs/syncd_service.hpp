@@ -93,6 +93,7 @@ private:
         const DeviceInfo& info,
         const PortState& port,
         std::string_view activation_id);
+    void publishServiceHeartbeat(bool hwsim_online);
     [[nodiscard]] std::vector<std::pair<std::string, std::map<std::string, std::string>>>
     portFaults(std::string_view device);
     void associatePortFaults(

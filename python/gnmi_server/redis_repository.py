@@ -8,6 +8,7 @@ import os
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Final
 
@@ -26,10 +27,12 @@ from gnmi_server.errors import (
 from gnmi_server.redis_keys import (
     CONFIG_DB,
     CONFIG_EVENTS,
+    COUNTERS_DB,
     config_revision_key,
     connection_config_key,
     connection_config_pattern,
     device_config_key,
+    device_counters_key,
     input_port_config_key,
     output_port_config_key,
 )
@@ -111,16 +114,26 @@ class RedisConfigRepository:
         ):
             raise ValueError("Redis deadlines must be positive")
         self._client = create_redis_client(self.settings, CONFIG_DB)
+        self._counters = create_redis_client(self.settings, COUNTERS_DB)
         self._timestamp_factory = timestamp_factory
         self._event_id_factory = event_id_factory
 
     async def close(self) -> None:
-        await self._client.aclose()
+        await asyncio.gather(self._client.aclose(), self._counters.aclose())
 
     async def flush_for_test(self) -> None:
-        await self._client.flushdb()
+        await asyncio.gather(self._client.flushdb(), self._counters.flushdb())
 
     async def commit(self, plan: SetPlan) -> SetCommitResult:
+        await self._increment_config_counter(plan.device, "config_requests_total")
+        try:
+            return await self._commit_candidate(plan)
+        except Exception:
+            with suppress(DeadlineExceededError, DependencyUnavailableError):
+                await self._increment_config_counter(plan.device, "config_rejected_total")
+            raise
+
+    async def _commit_candidate(self, plan: SetPlan) -> SetCommitResult:
         try:
             async with asyncio.timeout(self.settings.transaction_timeout_seconds):
                 for _ in range(self.settings.max_watch_retries):
@@ -133,6 +146,20 @@ class RedisConfigRepository:
         except RedisError as error:
             raise DependencyUnavailableError("CONFIG_DB") from error
         raise DependencyUnavailableError("CONFIG_DB changed during all transaction retries")
+
+    async def _increment_config_counter(self, device: str, field: str) -> None:
+        try:
+            async with asyncio.timeout(self.settings.transaction_timeout_seconds):
+                key = device_counters_key(device)
+                async with self._counters.pipeline(transaction=True) as pipeline:
+                    pipeline.hsetnx(key, "config_requests_total", 0)
+                    pipeline.hsetnx(key, "config_rejected_total", 0)
+                    pipeline.hincrby(key, field, 1)
+                    await pipeline.execute()
+        except (TimeoutError, RedisTimeoutError) as error:
+            raise DeadlineExceededError("COUNTERS_DB configuration counter") from error
+        except RedisError as error:
+            raise DependencyUnavailableError("COUNTERS_DB") from error
 
     async def _commit_once(self, plan: SetPlan) -> SetCommitResult:
         revision_key = config_revision_key(plan.device)

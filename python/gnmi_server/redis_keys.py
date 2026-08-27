@@ -11,6 +11,7 @@ ALARM_DB: Final = 8
 CONFIG_EVENTS: Final = "OCS_CONFIG_EVENTS"
 DEVICE_COMMANDS: Final = "OCS_DEVICE_COMMANDS"
 DEVICE_RESULTS: Final = "OCS_DEVICE_RESULTS"
+DEVICE_RETRIES: Final = "OCS_DEVICE_RETRIES"
 STATE_EVENTS: Final = "OCS_STATE_EVENTS"
 ALARM_EVENTS: Final = "OCS_ALARM_EVENTS"
 
@@ -49,6 +50,10 @@ def device_state_key(device: str) -> str:
 
 def device_state_pattern() -> str:
     return "OCS_DEVICE_STATE|*"
+
+
+def service_state_key(service: str) -> str:
+    return f"OCS_SERVICE_STATE|{service}"
 
 
 def input_port_state_key(device: str, port_id: int) -> str:

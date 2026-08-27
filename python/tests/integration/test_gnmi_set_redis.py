@@ -13,9 +13,11 @@ from gnmi_server.proto import gnmi_pb2, gnmi_pb2_grpc
 from gnmi_server.redis_keys import (
     CONFIG_DB,
     CONFIG_EVENTS,
+    COUNTERS_DB,
     config_revision_key,
     connection_config_key,
     device_config_key,
+    device_counters_key,
     input_port_config_key,
     output_port_config_key,
 )
@@ -58,6 +60,13 @@ async def test_conflicting_set_leaves_snapshot_revision_and_stream_unchanged() -
     observer = redis_async.Redis(
         unix_socket_path=socket_path,
         db=CONFIG_DB,
+        decode_responses=True,
+        socket_connect_timeout=1.0,
+        socket_timeout=1.0,
+    )
+    counter_observer = redis_async.Redis(
+        unix_socket_path=socket_path,
+        db=COUNTERS_DB,
         decode_responses=True,
         socket_connect_timeout=1.0,
         socket_timeout=1.0,
@@ -152,11 +161,15 @@ async def test_conflicting_set_leaves_snapshot_revision_and_stream_unchanged() -
                 "output_port": 9,
             },
         ]
+        counters = await counter_observer.hgetall(device_counters_key("ocs0"))
+        assert counters["config_requests_total"] == "3"
+        assert counters["config_rejected_total"] == "1"
     finally:
         await channel.close()
         await server.stop(0.5)
         await service.close()
         await observer.aclose()
+        await counter_observer.aclose()
 
 
 async def test_set_rejects_unknown_device_and_disabled_port_without_writes() -> None:

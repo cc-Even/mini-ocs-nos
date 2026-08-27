@@ -192,8 +192,27 @@ void SyncdService::initialize() {
     }
     device_name_ = info.name;
     device_generation_ = info.generation;
+    counters_db_.ensureHashFields(
+        redis::deviceCountersKey(info.name),
+        {
+            {"active_alarms", "0"},
+            {"active_connections", "0"},
+            {"config_rejected_total", "0"},
+            {"config_requests_total", "0"},
+            {"device_apply_failure_total", "0"},
+            {"device_apply_success_total", "0"},
+            {"device_apply_timeout_total", "0"},
+            {"device_apply_total", "0"},
+            {"drift_detected_total", "0"},
+            {"last_apply_latency_ms", "0"},
+            {"max_apply_latency_ms", "0"},
+            {"port_down_total", "0"},
+            {"reconciliation_success_total", "0"},
+            {"reconciliation_total", "0"},
+        });
     const auto actual = device_->getConnections();
     static_cast<void>(pollPortStates(info, actual));
+    publishServiceHeartbeat(true);
     const auto existing_state = state_db_.getHash(redis::deviceStateKey(info.name));
     if (existing_state.empty()) {
         state_db_.putHash(
@@ -258,6 +277,7 @@ bool SyncdService::pollDevice() {
             status->second != "READY") {
             publishDeviceState(info, actual.size(), "READY", Error::success());
         }
+        publishServiceHeartbeat(true);
         return true;
     } catch (const std::exception& error) {
         if (device_name_.empty()) {
@@ -283,8 +303,31 @@ bool SyncdService::pollDevice() {
                 "FAILED",
                 {ErrorCode::kDeviceNotReady, error.what()});
         }
+        publishServiceHeartbeat(false);
         return false;
     }
+}
+
+void SyncdService::publishServiceHeartbeat(bool hwsim_online) {
+    const auto now = std::to_string(timestampNowNs());
+    state_db_.putHashesAtomically({
+        {
+            redis::serviceStateKey("ocs-syncd"),
+            {
+                {"service", "ocs-syncd"},
+                {"status", "ONLINE"},
+                {"last_seen_ns", now},
+            },
+        },
+        {
+            redis::serviceStateKey("ocs-hwsim"),
+            {
+                {"service", "ocs-hwsim"},
+                {"status", hwsim_online ? "ONLINE" : "OFFLINE"},
+                {"last_seen_ns", now},
+            },
+        },
+    });
 }
 
 void SyncdService::publishDeviceState(
@@ -1270,7 +1313,7 @@ bool SyncdService::processOne(
         }
         device_db_.putHash(
             redis::deviceApplyResultKey(message.event.event_id),
-            {{"payload", durableResultPayload(malformed)}});
+            {{"payload", durableResultPayload(malformed)}, {"latency_ms", "0"}});
     }
 
     const auto result_key = redis::deviceApplyResultKey(message.event.event_id);
@@ -1292,6 +1335,7 @@ bool SyncdService::processOne(
                 {"payload", encodeDeviceCommand(batch)},
             }));
         ApplyResult result;
+        const auto apply_started = std::chrono::steady_clock::now();
         try {
             const auto device_info = device_->getDeviceInfo();
             device_name_ = device_info.name;
@@ -1314,7 +1358,15 @@ bool SyncdService::processOne(
         if (after_phase) {
             after_phase("device-apply");
         }
-        device_db_.putHash(result_key, {{"payload", durableResultPayload(result)}});
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - apply_started);
+        const auto latency_ms = (elapsed.count() + 999) / 1000;
+        device_db_.putHash(
+            result_key,
+            {
+                {"payload", durableResultPayload(result)},
+                {"latency_ms", std::to_string(latency_ms)},
+            });
         stored_result = device_db_.getHash(result_key);
     }
     const auto result_payload = stored_result.find("payload");
@@ -1338,11 +1390,15 @@ bool SyncdService::processOne(
     if (result.error.code == ErrorCode::kApplyTimeout) {
         counter_increments["device_apply_timeout_total"] = 1;
     }
-    static_cast<void>(counters_db_.incrementHashFieldsOnce(
+    const auto latency = stored_result.contains("latency_ms")
+                             ? std::stoll(stored_result.at("latency_ms"))
+                             : 0;
+    static_cast<void>(counters_db_.recordApplyCountersOnce(
         redis::syncdCountersPublicationKey(message.event.event_id),
         {{"command_id", message.event.event_id}},
         redis::deviceCountersKey(message.event.device),
-        counter_increments));
+        counter_increments,
+        latency));
     if (after_phase) {
         after_phase("counters");
     }

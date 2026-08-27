@@ -271,6 +271,10 @@ inline constexpr std::string_view kFaultCommands = "OCS_FAULT_COMMANDS";
     return "OCS_DEVICE_STATE|" + std::string(device);
 }
 
+[[nodiscard]] inline std::string serviceStateKey(std::string_view service) {
+    return "OCS_SERVICE_STATE|" + std::string(service);
+}
+
 [[nodiscard]] inline std::string inputPortStateKey(
     std::string_view device,
     std::string_view port_id) {

@@ -41,6 +41,7 @@ from gnmi_server.proto import gnmi_pb2
             PathKind.ALARM,
         ),
         ("/ocs/devices/device[name=ocs0]/counters", PathKind.COUNTERS),
+        ("/ocs/devices/device[name=ocs0]/diagnostics", PathKind.DIAGNOSTICS),
     ],
 )
 def test_parse_supported_native_paths(path: str, kind: PathKind) -> None:

@@ -24,6 +24,7 @@ public:
         ApplyRetryPolicy retry_policy = {});
 
     void initialize();
+    void publishHeartbeat();
     [[nodiscard]] bool processConfigOne(
         const std::string& consumer_name,
         const std::function<void(std::string_view)>& after_phase = {});
@@ -50,6 +51,7 @@ private:
     redis::RedisRepository device_db_;
     redis::RedisRepository alarm_db_;
     redis::RedisRepository counters_db_;
+    redis::RedisRepository state_db_;
     std::chrono::milliseconds pending_min_idle_;
     ApplyRetryPolicy retry_policy_;
 };

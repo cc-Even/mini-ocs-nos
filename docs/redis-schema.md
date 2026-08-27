@@ -82,8 +82,13 @@ single `connection-batch` event containing every final `UPSERT` and `REMOVE` to
 `OCS_CONFIG_EVENTS`. This preserves the Set transaction boundary through the
 device plane. Deleting a missing connection, including a repeated delete, is a
 successful no-op that does not advance the revision or append an event. A
-validation failure executes no Redis write, and a successful SetResponse
+validation failure executes no CONFIG_DB write, and a successful SetResponse
 confirms only this atomic desired-state persistence—not hardware application.
+Every final-candidate commit attempt increments `config_requests_total` in
+`OCS_DEVICE_COUNTERS|device`; a validation, conflict, deadline, or dependency
+failure after planning also increments `config_rejected_total`. The two fields
+are initialized together, and a secondary counter-publication failure never
+masks the original commit error.
 
 Integration tests keep Redis on an internal Docker network with protected mode
 enabled and no published TCP port. A random temporary Unix socket is mounted for
@@ -164,6 +169,11 @@ version zero. An `OCS_APPLY_TIMEOUT` result also increments
 `device_apply_timeout_total` in the same once-only counter publication. Hash
 snapshots are replaced with a Redis transaction so readers cannot observe the
 intermediate delete used to remove obsolete fields.
+The same publication stores integer `last_apply_latency_ms` and monotonically
+nondecreasing `max_apply_latency_ms`, measured around the deadline-bounded
+device apply. Its command marker makes counters and latency crash-replay
+idempotent. At syncd initialization, every required MVP device counter is added
+with zero only when absent, preserving values accumulated before a restart.
 
 Each processed batch appends one `APPLY_RESULT` event per command to
 `OCS_DEVICE_RESULTS`. Its payload records `success`, `error_code`,
@@ -344,6 +354,23 @@ orch publishes the newer command in stream order and keeps the resource in the
 appropriate executing state. The older result is then treated as stale, so
 rapid consecutive updates do not terminate the service or overwrite the latest
 application version.
+
+## Diagnostics and service liveness
+
+`ocsctl diagnostics show device` performs one state-only gNMI Get on
+`/ocs/devices/device[name=device]/diagnostics`; the CLI never reads Redis
+directly. The server reports device health, desired and confirmed-present
+connection counts, drift, active alarms, the pending count for each reliable
+consumer group, and the complete device counter hash.
+
+`ocs-orch` and `ocs-syncd` refresh `OCS_SERVICE_STATE|service` in STATE_DB with
+`status=ONLINE` and `last_seen_ns`. syncd records standalone hwsim as ONLINE
+after successful polling and OFFLINE after a failed poll. A diagnostics request
+is itself proof that the gNMI service is online; the other service heartbeats
+must be no older than two seconds. Missing, malformed, stale, or explicitly
+offline heartbeats make `core-services-online` false. Missing streams or groups
+have zero pending work, while other Redis errors retain the request's bounded
+deadline and normal gNMI error mapping.
 
 ## gNMI ON_CHANGE subscriptions
 

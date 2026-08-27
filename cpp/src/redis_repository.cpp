@@ -146,6 +146,19 @@ bool RedisRepository::putHashIfAbsent(
     throw std::runtime_error("Redis conditional hash write exceeded retry limit");
 }
 
+void RedisRepository::ensureHashFields(
+    const std::string& key,
+    const std::map<std::string, std::string>& fields) {
+    if (fields.empty()) {
+        return;
+    }
+    auto transaction = impl_->redis.transaction();
+    for (const auto& [field, value] : fields) {
+        transaction.hsetnx(key, field, value);
+    }
+    static_cast<void>(transaction.exec());
+}
+
 std::map<std::string, std::string> RedisRepository::getHash(const std::string& key) {
     std::map<std::string, std::string> result;
     impl_->redis.hgetall(key, std::inserter(result, result.end()));
@@ -296,6 +309,49 @@ bool RedisRepository::incrementHashFieldsOnce(
         }
     }
     throw std::runtime_error("Redis counter publication exceeded retry limit");
+}
+
+bool RedisRepository::recordApplyCountersOnce(
+    const std::string& marker_key,
+    const std::map<std::string, std::string>& marker_fields,
+    const std::string& key,
+    const std::map<std::string, long long>& increments,
+    long long latency_ms) {
+    if (latency_ms < 0) {
+        throw std::invalid_argument("device apply latency must not be negative");
+    }
+    for (int attempt = 0; attempt < kMaxWatchRetries; ++attempt) {
+        auto transaction = impl_->redis.transaction();
+        auto watched = transaction.redis();
+        watched.watch(marker_key);
+        watched.watch(key);
+        if (watched.exists(marker_key) != 0) {
+            watched.unwatch();
+            return false;
+        }
+        const auto existing_max = watched.hget(key, "max_apply_latency_ms");
+        const auto maximum = existing_max
+                                 ? std::max(latency_ms, std::stoll(*existing_max))
+                                 : latency_ms;
+        for (const auto& [field, increment] : increments) {
+            if (increment != 0) {
+                transaction.hincrby(key, field, increment);
+            }
+        }
+        const std::map<std::string, std::string> latency_fields{
+            {"last_apply_latency_ms", std::to_string(latency_ms)},
+            {"max_apply_latency_ms", std::to_string(maximum)},
+        };
+        transaction.hmset(key, latency_fields.begin(), latency_fields.end());
+        transaction.hmset(marker_key, marker_fields.begin(), marker_fields.end());
+        try {
+            static_cast<void>(transaction.exec());
+            return true;
+        } catch (const sw::redis::WatchError&) {
+            continue;
+        }
+    }
+    throw std::runtime_error("Redis apply counter publication exceeded retry limit");
 }
 
 bool RedisRepository::putVersionedHashesAtomicallyIfMarkerAbsent(

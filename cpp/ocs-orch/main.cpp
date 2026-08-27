@@ -59,7 +59,13 @@ int main(int argc, char* argv[]) {
         ocs::OrchestratorService service(
             std::move(endpoint), std::chrono::seconds(5), retryPolicy());
         service.initialize();
+        auto next_heartbeat = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
         while (running.load()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= next_heartbeat) {
+                service.publishHeartbeat();
+                next_heartbeat = now + std::chrono::milliseconds(250);
+            }
             const auto processed_config = service.processConfigOne("orch-main-config");
             const auto processed_result = service.processResultOne("orch-main-result");
             const auto processed_retry = service.processRetryOne("orch-main-retry");

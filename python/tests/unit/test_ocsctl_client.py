@@ -119,6 +119,7 @@ def test_cli_exposes_management_commands_and_has_no_redis_imports() -> None:
     assert result.exit_code == 0
     assert "capabilities" in result.stdout
     assert "connection" in result.stdout
+    assert "diagnostics" in result.stdout
     assert connection_help.exit_code == 0
     for command in ("batch", "create", "delete", "list", "replace", "watch"):
         assert command in connection_help.stdout

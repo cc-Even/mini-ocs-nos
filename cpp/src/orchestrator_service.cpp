@@ -256,7 +256,8 @@ OrchestratorService::OrchestratorService(
       appl_db_(endpoint, redis::LogicalDb::kAppl),
       device_db_(endpoint, redis::LogicalDb::kDevice),
       alarm_db_(endpoint, redis::LogicalDb::kAlarm),
-      counters_db_(std::move(endpoint), redis::LogicalDb::kCounters),
+      counters_db_(endpoint, redis::LogicalDb::kCounters),
+      state_db_(std::move(endpoint), redis::LogicalDb::kState),
       pending_min_idle_(pending_min_idle),
       retry_policy_(retry_policy) {
     if (pending_min_idle_.count() < 0 || pending_min_idle_ > std::chrono::hours(1)) {
@@ -274,6 +275,17 @@ void OrchestratorService::initialize() {
     device_db_.createConsumerGroup(std::string(redis::kDeviceResults), std::string(kConsumerGroup));
     device_db_.createConsumerGroup(
         std::string(redis::kDeviceRetries), std::string(kRetryConsumerGroup));
+    publishHeartbeat();
+}
+
+void OrchestratorService::publishHeartbeat() {
+    state_db_.putHash(
+        redis::serviceStateKey("ocs-orch"),
+        {
+            {"service", "ocs-orch"},
+            {"status", "ONLINE"},
+            {"last_seen_ns", std::to_string(timestampNowNs())},
+        });
 }
 
 bool OrchestratorService::processConfigOne(
