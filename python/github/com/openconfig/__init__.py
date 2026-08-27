@@ -1,0 +1,1 @@
+"""OpenConfig generated protocol bindings."""

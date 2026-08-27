@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := build
 
-.PHONY: bootstrap configure build cpp-test python-sync python-test lint test up redis-test redis-integration-test down
+.PHONY: bootstrap configure build cpp-test generate-protos python-sync python-test lint test up redis-test redis-integration-test down
 
 bootstrap:
 	./scripts/bootstrap.sh
@@ -13,6 +13,9 @@ build: configure python-sync
 
 cpp-test: build
 	ctest --preset dev
+
+generate-protos: python-sync
+	./scripts/generate-protos.sh
 
 python-sync:
 	UV_CACHE_DIR=$${UV_CACHE_DIR:-/tmp/mini-ocs-uv-cache} uv sync --frozen --python 3.12

@@ -16,6 +16,9 @@ dependencies = [
     "typer==0.16.0",
 ]
 
+[project.scripts]
+gnmi-server = "gnmi_server.server:main"
+
 [dependency-groups]
 dev = [
     "pytest==8.4.1",
@@ -24,7 +27,10 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["python/gnmi_server", "python/ocsctl"]
+packages = ["python/github", "python/gnmi_server", "python/ocsctl"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"proto/github.com/openconfig/gnmi/LICENSE" = "gnmi_server/licenses/openconfig-gnmi-LICENSE"
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
@@ -34,6 +40,7 @@ asyncio_mode = "auto"
 [tool.ruff]
 target-version = "py312"
 line-length = 100
+extend-exclude = ["python/github"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
