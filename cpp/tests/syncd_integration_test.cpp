@@ -135,4 +135,56 @@ TEST_F(SyncdIntegrationTest, AppliesCommandPublishesStateAndResultThenAcknowledg
     EXPECT_EQ(device_db_->pendingCount(std::string(ocs::redis::kDeviceCommands), "ocs-syncd"), 0);
 }
 
+TEST_F(SyncdIntegrationTest, FailedUpdatePreservesLastConfirmedActualConnection) {
+    const auto append_command = [this](
+                                    std::string event_id,
+                                    ocs::PortId input_port,
+                                    ocs::PortId output_port,
+                                    std::uint64_t desired_version) {
+        const ocs::DeviceCommandBatch batch{
+            .commands = {{
+                .id = "conn-preserve",
+                .input_port = input_port,
+                .output_port = output_port,
+                .desired_version = desired_version,
+            }},
+            .options = {},
+        };
+        const ocs::redis::EventEnvelope event{
+            .event_schema_version = 1,
+            .event_id = std::move(event_id),
+            .request_id = "request-preserve-" + std::to_string(desired_version),
+            .timestamp_ns = 1780000000000000030ULL + desired_version,
+            .device = "ocs0",
+            .resource_type = "connection",
+            .resource_id = "conn-preserve",
+            .operation = "UPSERT",
+            .desired_version = desired_version,
+            .payload = ocs::encodeDeviceCommand(batch),
+        };
+        static_cast<void>(device_db_->appendEvent(
+            std::string(ocs::redis::kDeviceCommands), event));
+    };
+
+    append_command("command-preserve-001", 1, 9, 1);
+    ASSERT_TRUE(syncd_->processOne("syncd-test-preserve"));
+    ASSERT_TRUE(simulated_device_->injectFault({.type = ocs::FaultType::kNextApplyError}).error.ok());
+    append_command("command-preserve-002", 2, 10, 2);
+    ASSERT_TRUE(syncd_->processOne("syncd-test-preserve"));
+
+    const auto state =
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "conn-preserve"));
+    EXPECT_EQ(state.at("input_port"), "1");
+    EXPECT_EQ(state.at("output_port"), "9");
+    EXPECT_EQ(state.at("desired_version"), "2");
+    EXPECT_EQ(state.at("applied_version"), "1");
+    EXPECT_EQ(state.at("apply_status"), "FAILED");
+    EXPECT_EQ(state.at("last_error_code"), "OCS_APPLY_FAILED");
+    const auto actual = simulated_device_->getConnections();
+    ASSERT_EQ(actual.size(), 1);
+    EXPECT_EQ(actual.front().input_port, 1);
+    EXPECT_EQ(actual.front().output_port, 9);
+    EXPECT_EQ(actual.front().applied_version, 1);
+}
+
 }  // namespace

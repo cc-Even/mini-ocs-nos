@@ -89,10 +89,12 @@ void RedisRepository::ping() {
 void RedisRepository::putHash(
     const std::string& key,
     const std::map<std::string, std::string>& fields) {
-    impl_->redis.del(key);
+    auto transaction = impl_->redis.transaction();
+    transaction.del(key);
     if (!fields.empty()) {
-        impl_->redis.hmset(key, fields.begin(), fields.end());
+        transaction.hmset(key, fields.begin(), fields.end());
     }
+    static_cast<void>(transaction.exec());
 }
 
 std::map<std::string, std::string> RedisRepository::getHash(const std::string& key) {

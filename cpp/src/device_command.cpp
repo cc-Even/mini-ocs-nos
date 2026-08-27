@@ -3,7 +3,10 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <cstdint>
+#include <limits>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -24,6 +27,26 @@ ConnectionOperation parseOperation(std::string_view operation) {
         return ConnectionOperation::kRemove;
     }
     throw std::invalid_argument("unsupported device command operation");
+}
+
+PortId parsePort(const Json& command, const char* field) {
+    const auto& value = command.at(field);
+    std::uint64_t parsed{};
+    if (value.is_number_unsigned()) {
+        parsed = value.get<std::uint64_t>();
+    } else if (value.is_number_integer()) {
+        const auto signed_value = value.get<std::int64_t>();
+        if (signed_value <= 0) {
+            throw std::invalid_argument(std::string(field) + " must be positive");
+        }
+        parsed = static_cast<std::uint64_t>(signed_value);
+    } else {
+        throw std::invalid_argument(std::string(field) + " must be an integer");
+    }
+    if (parsed == 0 || parsed > std::numeric_limits<PortId>::max()) {
+        throw std::invalid_argument(std::string(field) + " is outside the supported port range");
+    }
+    return static_cast<PortId>(parsed);
 }
 
 }  // namespace
@@ -55,13 +78,17 @@ DeviceCommandBatch decodeDeviceCommand(const std::string& payload) {
         throw std::invalid_argument("device command timeout must be positive");
     }
     for (const auto& command : value.at("commands")) {
-        batch.commands.push_back({
-            .operation = parseOperation(command.at("operation").get<std::string>()),
+        const auto operation = parseOperation(command.at("operation").get<std::string>());
+        ConnectionCommand decoded{
+            .operation = operation,
             .id = command.at("id").get<std::string>(),
-            .input_port = command.at("input_port").get<PortId>(),
-            .output_port = command.at("output_port").get<PortId>(),
             .desired_version = command.at("desired_version").get<std::uint64_t>(),
-        });
+        };
+        if (operation == ConnectionOperation::kUpsert) {
+            decoded.input_port = parsePort(command, "input_port");
+            decoded.output_port = parsePort(command, "output_port");
+        }
+        batch.commands.push_back(std::move(decoded));
     }
     if (batch.commands.empty()) {
         throw std::invalid_argument("device command batch must not be empty");

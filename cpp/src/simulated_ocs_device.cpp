@@ -53,8 +53,6 @@ ApplyResult SimulatedOcsDevice::applyConnections(
 
     std::scoped_lock lock(mutex_);
     auto candidate_connections = connections_;
-    auto candidate_input_to_output = input_to_output_;
-    auto candidate_output_to_input = output_to_input_;
 
     for (const auto& command : commands) {
         if (command.id.empty()) {
@@ -63,12 +61,9 @@ ApplyResult SimulatedOcsDevice::applyConnections(
 
         if (command.operation == ConnectionOperation::kRemove) {
             const auto existing = candidate_connections.find(command.id);
-            if (existing == candidate_connections.end()) {
-                return {makeError(ErrorCode::kConnectionNotFound, "connection does not exist"), {}};
+            if (existing != candidate_connections.end()) {
+                candidate_connections.erase(existing);
             }
-            candidate_input_to_output.at(existing->second.input_port - 1).reset();
-            candidate_output_to_input.at(existing->second.output_port - 1).reset();
-            candidate_connections.erase(existing);
             continue;
         }
 
@@ -81,21 +76,7 @@ ApplyResult SimulatedOcsDevice::applyConnections(
             return {error, {}};
         }
 
-        if (const auto existing = candidate_connections.find(command.id);
-            existing != candidate_connections.end()) {
-            candidate_input_to_output.at(existing->second.input_port - 1).reset();
-            candidate_output_to_input.at(existing->second.output_port - 1).reset();
-            candidate_connections.erase(existing);
-        }
-
-        if (candidate_input_to_output.at(command.input_port - 1).has_value()) {
-            return {makeError(ErrorCode::kInputConflict, "input port is already connected"), {}};
-        }
-        if (candidate_output_to_input.at(command.output_port - 1).has_value()) {
-            return {makeError(ErrorCode::kOutputConflict, "output port is already connected"), {}};
-        }
-
-        candidate_connections.emplace(
+        candidate_connections.insert_or_assign(
             command.id,
             AppliedConnection{
                 command.id,
@@ -103,8 +84,20 @@ ApplyResult SimulatedOcsDevice::applyConnections(
                 command.output_port,
                 command.desired_version,
             });
-        candidate_input_to_output.at(command.input_port - 1) = command.output_port;
-        candidate_output_to_input.at(command.output_port - 1) = command.input_port;
+    }
+
+    std::vector<std::optional<PortId>> candidate_input_to_output(info_.input_port_count);
+    std::vector<std::optional<PortId>> candidate_output_to_input(info_.output_port_count);
+    for (const auto& [id, connection] : candidate_connections) {
+        static_cast<void>(id);
+        if (candidate_input_to_output.at(connection.input_port - 1).has_value()) {
+            return {makeError(ErrorCode::kInputConflict, "input port is already connected"), {}};
+        }
+        if (candidate_output_to_input.at(connection.output_port - 1).has_value()) {
+            return {makeError(ErrorCode::kOutputConflict, "output port is already connected"), {}};
+        }
+        candidate_input_to_output.at(connection.input_port - 1) = connection.output_port;
+        candidate_output_to_input.at(connection.output_port - 1) = connection.input_port;
     }
 
     if (fail_next_apply_) {

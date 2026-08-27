@@ -142,11 +142,31 @@ void SyncdService::publishState(
             continue;
         }
 
+        if (!result.ok()) {
+            auto state = state_db_.getHash(state_key);
+            if (state.empty()) {
+                state = {
+                    {"device", command_event.device},
+                    {"id", command.id},
+                    {"input_port", std::to_string(command.input_port)},
+                    {"output_port", std::to_string(command.output_port)},
+                    {"applied_version", "0"},
+                };
+            }
+            state["desired_version"] = std::to_string(command.desired_version);
+            state["apply_status"] = "FAILED";
+            state["last_error_code"] = std::string(toString(result.error.code));
+            state["last_error_message"] = result.error.message;
+            state_db_.putHash(state_key, state);
+            continue;
+        }
+
         const auto applied = std::ranges::find_if(result.connections, [&command](const auto& item) {
             return item.id == command.id;
         });
-        const auto applied_version =
-            applied == result.connections.end() ? std::uint64_t{} : applied->applied_version;
+        if (applied == result.connections.end()) {
+            throw std::runtime_error("successful device apply omitted connection result");
+        }
         state_db_.putHash(
             state_key,
             {
@@ -155,8 +175,8 @@ void SyncdService::publishState(
                 {"input_port", std::to_string(command.input_port)},
                 {"output_port", std::to_string(command.output_port)},
                 {"desired_version", std::to_string(command.desired_version)},
-                {"applied_version", std::to_string(applied_version)},
-                {"apply_status", result.ok() ? "ACTIVE" : "FAILED"},
+                {"applied_version", std::to_string(applied->applied_version)},
+                {"apply_status", "ACTIVE"},
                 {"last_error_code", std::string(toString(result.error.code))},
                 {"last_error_message", result.error.message},
             });

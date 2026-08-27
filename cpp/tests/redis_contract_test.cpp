@@ -3,9 +3,12 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <barrier>
 #include <cstdlib>
 #include <map>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -47,6 +50,45 @@ TEST_F(RedisContractTest, SeparatesSnapshotsByLogicalDatabase) {
     EXPECT_TRUE(state_->getHash(key).empty());
     EXPECT_TRUE(config_->deleteKey(key));
     EXPECT_TRUE(config_->getHash(key).empty());
+}
+
+TEST_F(RedisContractTest, ReplacesHashWithoutRetainingOldFields) {
+    const auto key = ocs::redis::connectionConfigKey("ocs0", "conn-replace");
+    config_->putHash(key, {{"desired_version", "1"}, {"obsolete", "value"}});
+
+    const std::map<std::string, std::string> replacement{{"desired_version", "2"}};
+    config_->putHash(key, replacement);
+
+    EXPECT_EQ(config_->getHash(key), replacement);
+}
+
+TEST_F(RedisContractTest, NeverExposesIntermediateMissingHashDuringReplacement) {
+    const auto key = ocs::redis::connectionConfigKey("ocs0", "conn-atomic-replace");
+    config_->putHash(key, {{"desired_version", "0"}, {"marker", "initial"}});
+    ocs::redis::RedisRepository observer(endpoint_, ocs::redis::LogicalDb::kConfig);
+    std::barrier start(2);
+    std::atomic<bool> writer_done{false};
+    std::atomic<bool> observed_missing{false};
+    std::jthread reader([&] {
+        start.arrive_and_wait();
+        while (!writer_done.load()) {
+            if (observer.getHash(key).empty()) {
+                observed_missing.store(true);
+                return;
+            }
+        }
+    });
+
+    start.arrive_and_wait();
+    for (int version = 1; version <= 2000; ++version) {
+        config_->putHash(
+            key,
+            {{"desired_version", std::to_string(version)}, {"marker", "replacement"}});
+    }
+    writer_done.store(true);
+    reader.join();
+
+    EXPECT_FALSE(observed_missing.load());
 }
 
 TEST_F(RedisContractTest, DeliversVersionedEventThroughConsumerGroupAndAck) {

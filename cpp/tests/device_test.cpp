@@ -203,4 +203,43 @@ TEST(InProcessSimBackendTest, UpsertMovesExistingConnectionAndReleasesOldPorts) 
     EXPECT_EQ(actual.at(1).id, "conn-002");
 }
 
+TEST(InProcessSimBackendTest, AtomicallySwapsOutputsWithoutCommandOrderDependency) {
+    auto backend = makeBackend();
+    ASSERT_TRUE(
+        backend
+            ->applyConnections(
+                {
+                    {.id = "conn-001", .input_port = 1, .output_port = 9, .desired_version = 1},
+                    {.id = "conn-002", .input_port = 2, .output_port = 10, .desired_version = 1},
+                },
+                {})
+            .ok());
+
+    const auto result = backend->applyConnections(
+        {
+            {.id = "conn-001", .input_port = 1, .output_port = 10, .desired_version = 2},
+            {.id = "conn-002", .input_port = 2, .output_port = 9, .desired_version = 2},
+        },
+        {});
+
+    ASSERT_TRUE(result.ok());
+    const auto actual = backend->getConnections();
+    ASSERT_EQ(actual.size(), 2);
+    EXPECT_EQ(actual.at(0).output_port, 10);
+    EXPECT_EQ(actual.at(1).output_port, 9);
+}
+
+TEST(InProcessSimBackendTest, RemovingAbsentConnectionIsIdempotent) {
+    auto backend = makeBackend();
+
+    const auto result = backend->applyConnections(
+        {{.operation = ocs::ConnectionOperation::kRemove,
+          .id = "already-absent",
+          .desired_version = 2}},
+        {});
+
+    EXPECT_TRUE(result.ok());
+    EXPECT_TRUE(backend->getConnections().empty());
+}
+
 }  // namespace

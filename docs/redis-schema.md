@@ -68,9 +68,16 @@ batch:
 
 Successful UPSERT commands replace `OCS_CONNECTION_STATE|device|id` in
 STATE_DB with the confirmed ports, desired/applied versions, and `ACTIVE`
-status. Successful REMOVE commands delete that state key. Every attempt
+status. Successful REMOVE commands delete that state key; removing an already
+absent device connection is an idempotent success so a delete can converge
+after an older create fails. Every attempt
 increments `device_apply_total` and one of `device_apply_success_total` or
 `device_apply_failure_total` in `OCS_DEVICE_COUNTERS|device` in COUNTERS_DB.
+If an update or delete fails, syncd retains the last confirmed actual ports and
+applied version while advancing the desired version and recording `FAILED` plus
+the stable device error. A failed create without prior actual state uses applied
+version zero. Hash snapshots are replaced with a Redis transaction so readers
+cannot observe the intermediate delete used to remove obsolete fields.
 
 Each processed command appends an `APPLY_RESULT` event to
 `OCS_DEVICE_RESULTS`. Its payload records `success`, `error_code`, and
@@ -111,3 +118,8 @@ version. Late device results cannot overwrite a newer application state.
 Successful deletes retain an `ABSENT` APPL_DB tombstone with the applied desired
 version so a late pre-delete event cannot recreate the connection. These
 snapshots let an ordinary orch restart resume without an in-memory cache.
+When a newer event arrives while the prior device command is still outstanding,
+orch publishes the newer command in stream order and keeps the resource in the
+appropriate executing state. The older result is then treated as stale, so
+rapid consecutive updates do not terminate the service or overwrite the latest
+application version.

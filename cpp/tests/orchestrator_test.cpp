@@ -44,6 +44,22 @@ TEST(ConnectionStateMachineTest, RejectsInvalidTransitionsAndUnknownNames) {
         std::invalid_argument);
 }
 
+TEST(DeviceCommandTest, RejectsPortsThatWouldNarrowIntoTheSupportedRange) {
+    const std::string payload = R"({
+        "commands":[{
+            "operation":"UPSERT",
+            "id":"conn-overflow",
+            "input_port":65537,
+            "output_port":9,
+            "desired_version":1
+        }],
+        "atomic":true,
+        "timeout_ms":1000
+    })";
+
+    EXPECT_THROW(static_cast<void>(ocs::decodeDeviceCommand(payload)), std::invalid_argument);
+}
+
 class OrchestratorIntegrationTest : public testing::Test {
 protected:
     void SetUp() override {
@@ -180,6 +196,126 @@ TEST_F(OrchestratorIntegrationTest, ConfigEventReachesActiveThroughStandaloneHws
         device_db_->pendingCount(std::string(ocs::redis::kDeviceCommands), "ocs-syncd"), 0);
     EXPECT_EQ(
         device_db_->pendingCount(std::string(ocs::redis::kDeviceResults), "ocs-orch"), 0);
+}
+
+TEST_F(OrchestratorIntegrationTest, CoalescesConsecutiveVersionsWhileApplyIsOutstanding) {
+    const ocs::redis::EventEnvelope first{
+        .event_schema_version = 1,
+        .event_id = "event-consecutive-001",
+        .request_id = "request-consecutive-001",
+        .timestamp_ns = 1780000000000000020ULL,
+        .device = "ocs0",
+        .resource_type = "connection",
+        .resource_id = "conn-consecutive-001",
+        .operation = "UPSERT",
+        .desired_version = 1,
+        .payload = R"({"input_port":1,"output_port":9})",
+    };
+    auto second = first;
+    second.event_id = "event-consecutive-002";
+    second.request_id = "request-consecutive-002";
+    second.timestamp_ns += 1;
+    second.desired_version = 2;
+    second.payload = R"({"input_port":2,"output_port":10})";
+    static_cast<void>(
+        config_db_->appendEvent(std::string(ocs::redis::kConfigEvents), first));
+    static_cast<void>(
+        config_db_->appendEvent(std::string(ocs::redis::kConfigEvents), second));
+
+    ASSERT_TRUE(orch_->processConfigOne("orch-test-consecutive"));
+    ASSERT_TRUE(orch_->processConfigOne("orch-test-consecutive"));
+    const auto applying =
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "conn-consecutive-001"));
+    EXPECT_EQ(applying.at("desired_version"), "2");
+    EXPECT_EQ(applying.at("apply_status"), "APPLYING");
+
+    ASSERT_TRUE(syncd_->processOne("syncd-test-consecutive"));
+    ASSERT_TRUE(orch_->processResultOne("orch-test-consecutive-result"));
+    ASSERT_TRUE(syncd_->processOne("syncd-test-consecutive"));
+    ASSERT_TRUE(orch_->processResultOne("orch-test-consecutive-result"));
+
+    const auto state =
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "conn-consecutive-001"));
+    EXPECT_EQ(state.at("input_port"), "2");
+    EXPECT_EQ(state.at("output_port"), "10");
+    EXPECT_EQ(state.at("desired_version"), "2");
+    EXPECT_EQ(state.at("applied_version"), "2");
+    EXPECT_EQ(state.at("apply_status"), "ACTIVE");
+    const auto active =
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "conn-consecutive-001"));
+    EXPECT_EQ(active.at("desired_version"), "2");
+    EXPECT_EQ(active.at("apply_status"), "ACTIVE");
+}
+
+TEST_F(OrchestratorIntegrationTest, RejectsConfigPortThatWouldNarrowIntoTheMatrix) {
+    const ocs::redis::EventEnvelope event{
+        .event_schema_version = 1,
+        .event_id = "event-overflow-001",
+        .request_id = "request-overflow-001",
+        .timestamp_ns = 1780000000000000022ULL,
+        .device = "ocs0",
+        .resource_type = "connection",
+        .resource_id = "conn-overflow-001",
+        .operation = "UPSERT",
+        .desired_version = 1,
+        .payload = R"({"input_port":65537,"output_port":9})",
+    };
+    static_cast<void>(
+        config_db_->appendEvent(std::string(ocs::redis::kConfigEvents), event));
+
+    EXPECT_THROW(
+        static_cast<void>(orch_->processConfigOne("orch-test-overflow")),
+        std::invalid_argument);
+    EXPECT_TRUE(
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "conn-overflow-001")).empty());
+    EXPECT_FALSE(syncd_->processOne("syncd-test-overflow"));
+}
+
+TEST_F(OrchestratorIntegrationTest, LatestRemoveConvergesWhenOutstandingCreateFails) {
+    const ocs::redis::EventEnvelope create{
+        .event_schema_version = 1,
+        .event_id = "event-create-remove-001",
+        .request_id = "request-create-remove-001",
+        .timestamp_ns = 1780000000000000023ULL,
+        .device = "ocs0",
+        .resource_type = "connection",
+        .resource_id = "conn-create-remove-001",
+        .operation = "UPSERT",
+        .desired_version = 1,
+        .payload = R"({"input_port":3,"output_port":11})",
+    };
+    auto remove = create;
+    remove.event_id = "event-create-remove-002";
+    remove.request_id = "request-create-remove-002";
+    remove.timestamp_ns += 1;
+    remove.operation = "REMOVE";
+    remove.desired_version = 2;
+    remove.payload = "{}";
+    static_cast<void>(
+        config_db_->appendEvent(std::string(ocs::redis::kConfigEvents), create));
+    static_cast<void>(
+        config_db_->appendEvent(std::string(ocs::redis::kConfigEvents), remove));
+    ASSERT_TRUE(orch_->processConfigOne("orch-test-create-remove"));
+    ASSERT_TRUE(orch_->processConfigOne("orch-test-create-remove"));
+
+    {
+        ocs::UdsDeviceBackend fault_backend(hwsim_socket_);
+        ASSERT_TRUE(
+            fault_backend.injectFault({.type = ocs::FaultType::kNextApplyError}).error.ok());
+    }
+    ASSERT_TRUE(syncd_->processOne("syncd-test-create-remove"));
+    ASSERT_TRUE(orch_->processResultOne("orch-test-create-remove-result"));
+    ASSERT_TRUE(syncd_->processOne("syncd-test-create-remove"));
+    ASSERT_TRUE(orch_->processResultOne("orch-test-create-remove-result"));
+
+    EXPECT_TRUE(
+        state_db_->getHash(
+            ocs::redis::connectionStateKey("ocs0", "conn-create-remove-001"))
+            .empty());
+    const auto application =
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "conn-create-remove-001"));
+    EXPECT_EQ(application.at("desired_version"), "2");
+    EXPECT_EQ(application.at("apply_status"), "ABSENT");
 }
 
 TEST_F(OrchestratorIntegrationTest, ReloadsVersionGapAndSuppressesStaleAndDuplicateWork) {

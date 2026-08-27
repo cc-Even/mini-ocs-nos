@@ -38,6 +38,26 @@ std::uint64_t currentVersion(const std::map<std::string, std::string>& applicati
     return version == application.end() ? std::uint64_t{} : std::stoull(version->second);
 }
 
+PortId decodePort(const nlohmann::json& payload, const char* field) {
+    const auto& value = payload.at(field);
+    std::uint64_t parsed{};
+    if (value.is_number_unsigned()) {
+        parsed = value.get<std::uint64_t>();
+    } else if (value.is_number_integer()) {
+        const auto signed_value = value.get<std::int64_t>();
+        if (signed_value <= 0) {
+            throw std::invalid_argument(std::string(field) + " must be positive");
+        }
+        parsed = static_cast<std::uint64_t>(signed_value);
+    } else {
+        throw std::invalid_argument(std::string(field) + " must be an integer");
+    }
+    if (parsed == 0 || parsed > std::numeric_limits<PortId>::max()) {
+        throw std::invalid_argument(std::string(field) + " is outside the supported port range");
+    }
+    return static_cast<PortId>(parsed);
+}
+
 ConnectionCommand decodeConfigEvent(const redis::EventEnvelope& event) {
     if (event.resource_type != "connection") {
         throw std::invalid_argument("orch only supports connection configuration events");
@@ -59,11 +79,8 @@ ConnectionCommand decodeConfigEvent(const redis::EventEnvelope& event) {
     }
 
     const auto payload = nlohmann::json::parse(event.payload);
-    command.input_port = payload.at("input_port").get<PortId>();
-    command.output_port = payload.at("output_port").get<PortId>();
-    if (command.input_port == 0 || command.output_port == 0) {
-        throw std::invalid_argument("connection ports must be positive");
-    }
+    command.input_port = decodePort(payload, "input_port");
+    command.output_port = decodePort(payload, "output_port");
     return command;
 }
 
@@ -119,6 +136,10 @@ ConnectionApplyStatus startApplyTransition(
     const auto executing = operation == ConnectionOperation::kRemove
                                ? ConnectionApplyStatus::kRemoving
                                : ConnectionApplyStatus::kApplying;
+    if (current == ConnectionApplyStatus::kApplying ||
+        current == ConnectionApplyStatus::kRemoving) {
+        return executing;
+    }
     if (current == ConnectionApplyStatus::kFailed) {
         requireTransition(current, ConnectionApplyStatus::kRetryWait);
         requireTransition(ConnectionApplyStatus::kRetryWait, executing);
