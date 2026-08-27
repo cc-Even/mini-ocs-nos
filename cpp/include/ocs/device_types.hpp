@@ -83,6 +83,7 @@ enum class FaultType {
     kInputPortDown,
     kOutputPortDown,
     kOutOfBandDrift,
+    kAll,
 };
 
 struct FaultSpec {

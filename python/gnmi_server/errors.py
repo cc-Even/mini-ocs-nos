@@ -57,6 +57,13 @@ class DeadlineExceededError(GnmiServiceError):
     detail_prefix = "deadline exceeded"
 
 
+class PermissionDeniedError(GnmiServiceError):
+    """A development-only management surface is disabled."""
+
+    status_code = grpc.StatusCode.PERMISSION_DENIED
+    detail_prefix = "permission denied"
+
+
 @dataclass(frozen=True)
 class RpcStatus:
     """Sanitized status returned at the gRPC boundary."""

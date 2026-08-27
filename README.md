@@ -126,7 +126,7 @@ databases, versions, state transitions, and atomicity.
   and reconciles with a complete desired snapshot.
 
 The formal integration path uses `UdsDeviceBackend` and a standalone
-`ocs-hwsim`, and the planned operator demo must use the same path. Unit tests
+`ocs-hwsim`, and the reproducible operator demo uses the same path. Unit tests
 also keep `InProcessSimBackend` for fast, deterministic domain testing; it is
 not used to bypass the formal service boundary.
 
@@ -154,11 +154,24 @@ uv run --frozen ocsctl alarm list ocs0
 uv run --frozen ocsctl counters show ocs0
 ```
 
-Simulator fault controls are intentionally not part of the gNMI management API
-yet. The internal `ocs-hwsimctl` helper can inject and clear port faults over
-UDS for tests; timeout, drift, restart, and crash faults are exercised by the
-automated reliability fixtures. Do not edit Redis manually to simulate device
-success or failure. See [the CLI guide](docs/cli.md) for supported workflows.
+The development-only fault subtree is disabled unless the gNMI server starts
+with `OCS_ENABLE_FAULT_API=1`. When enabled, `ocsctl fault` sends supported
+timeout/error and port DOWN/clear commands through gNMI, a reliable DEVICE_DB
+stream, syncd, and UDS. It never edits Redis or opens the simulator socket
+itself. Out-of-band drift, process crashes, and restarts remain automated-test
+controls. See [the CLI guide](docs/cli.md) for the exact boundary.
+
+For a self-cleaning guided run on ports and Compose resources isolated from the
+default stack:
+
+```bash
+make demo
+```
+
+The demo exercises health, normal configuration, ON_CHANGE, atomic conflict
+rejection, timeout failure, alarm/counter evidence, recovery, diagnostics, and
+the packaged E2E summary. See [Demo](docs/demo.md) and the validated
+[test report](docs/test-report.md).
 
 ## Build and test
 
@@ -169,13 +182,13 @@ make sanitizer-test               # C++ unit suite under ASan/UBSan
 make sanitizer-integration-test   # Redis integration under ASan/UBSan
 make image                        # all four non-root service images
 make e2e                          # isolated full-Compose gNMI vertical slice
+make demo                         # guided operator flow plus packaged E2E
 ```
 
 The integration harness removes its temporary containers and volumes and saves
 logs under the ignored `artifacts/test-logs/` directory. The Compose E2E uses
-port 50052 and an isolated project name so it does not reuse the default stack.
-The scripted operator demo and test report are Phase 5 follow-up deliverables;
-no `make demo` target is claimed in the current tree.
+port 50052 and an isolated project name. The demo uses port 50053 and its own
+project name; neither reuses the default stack.
 
 See [Testing](docs/testing.md) for suite coverage, scenarios A–H, CI jobs, and
 failure artifacts.
@@ -186,6 +199,8 @@ failure artifacts.
 - [Data model](docs/data-model.md)
 - [Failure and recovery model](docs/failure-model.md)
 - [Testing](docs/testing.md)
+- [Reproducible demo](docs/demo.md)
+- [Validated test report](docs/test-report.md)
 - [Known limitations](docs/limitations.md)
 - [Redis state and event contract](docs/redis-schema.md)
 - [CLI workflows](docs/cli.md)

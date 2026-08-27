@@ -66,21 +66,30 @@ ON_CHANGE values, and delete notifications. The client cancels the RPC and the
 server releases its per-subscription tasks when the duration expires or the
 user interrupts it.
 
-## Simulator-only port fault control
+## Simulator-only fault control
 
-`ocs-hwsimctl` is an internal test harness, not an operator management API. It
-talks directly to standalone hwsim over UDS and only supports deterministic
-input/output port faults:
+The gNMI fault subtree is development-only and disabled by default. A server
+started with `OCS_ENABLE_FAULT_API=1` accepts these `ocsctl` commands:
 
 ```bash
-build/dev/cpp/ocs-hwsimctl /tmp/mini-ocs/ocs-hwsim.sock inject INPUT_PORT_DOWN 3
-build/dev/cpp/ocs-hwsimctl /tmp/mini-ocs/ocs-hwsim.sock clear INPUT_PORT_DOWN 3
-build/dev/cpp/ocs-hwsimctl /tmp/mini-ocs/ocs-hwsim.sock inject OUTPUT_PORT_DOWN 11
-build/dev/cpp/ocs-hwsimctl /tmp/mini-ocs/ocs-hwsim.sock clear OUTPUT_PORT_DOWN 11
+ocsctl fault inject ocs0 next-apply-timeout
+ocsctl fault inject ocs0 next-apply-error
+ocsctl fault inject ocs0 input-port-down --port 3
+ocsctl fault inject ocs0 output-port-down --port 11
+ocsctl fault clear ocs0 --fault input-port-down --port 3
+ocsctl fault clear ocs0 --all
 ```
 
-Production management remains gNMI-only. The helper exists so reliability
-tests can alter simulator state without writing production-path Redis data.
+The CLI writes only gNMI Set requests. The server publishes one reliable fault
+command, syncd calls its normal `UdsDeviceBackend`, and the RPC returns only
+after a confirmed simulator result or its bounded deadline. With the feature
+flag absent, the same Set returns `PERMISSION_DENIED`. The flag must never be
+enabled on an endpoint exposed to an untrusted network.
+
+`ocs-hwsimctl` remains an internal test helper for direct local UDS testing.
+Out-of-band drift is intentionally excluded from `ocsctl`: injecting it is not
+an idempotent management operation. Process crash and restart controls also
+remain in automated fixtures.
 
 ## Management and reliability acceptance
 
@@ -90,10 +99,11 @@ creates 1→9, 2→10, and 3→11, verifies all are ACTIVE with matching version
 `active-connections=3`, then exercises watch, replace, and delete. Scenario B
 submits a conflicting batch and verifies through gNMI that configuration,
 operational state, and counters remain unchanged.
-Scenario H injects an input-port fault through `ocs-hwsimctl`, verifies gNMI
-Subscribe reports DOWN and UP, observes the related connection and alarm, then
-waits for same-version full-snapshot recovery and zero active alarms.
+Scenario H enables the development fault API and injects an input-port fault
+through `ocsctl`, verifies gNMI Subscribe reports DOWN and UP, observes the
+related connection and alarm, then waits for same-version full-snapshot
+recovery and zero active alarms.
 
-Next-apply timeout/error, out-of-band drift, process crash, and hwsim restart
-are driven by automated reliability fixtures rather than operator CLI commands.
-There is currently no public `ocsctl fault` command.
+The reproducible `make demo` flow also uses `ocsctl fault` for a one-shot apply
+timeout. Out-of-band drift, process crash, and hwsim restart remain automated
+fixture controls.

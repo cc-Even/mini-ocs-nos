@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from gnmi_server.path_parser import protobuf_path
 from gnmi_server.proto import gnmi_pb2
-from ocsctl.client import ConnectionSpec, GnmiClient, connection_path
+from ocsctl.client import ConnectionSpec, GnmiClient, connection_path, fault_path
 from ocsctl.main import app
 from typer.testing import CliRunner
 
@@ -111,6 +111,25 @@ async def test_client_builds_update_replace_and_delete_requests() -> None:
     assert replaced["operations"][0]["operation"] == "REPLACE"
     assert deleted["operations"][0]["operation"] == "DELETE"
     assert all(call[2] == 2.0 for call in stub.calls)
+
+
+async def test_client_builds_fault_inject_and_clear_requests() -> None:
+    stub = FakeStub()
+    client = GnmiClient(timeout_seconds=2.0, stub=stub)
+
+    injected = await client.inject_fault("ocs0", "next-apply-timeout")
+    cleared = await client.clear_fault("ocs0")
+
+    inject_request = stub.calls[0][1]
+    assert inject_request.update[0].path == protobuf_path(
+        fault_path("ocs0", "next-apply-timeout", "config")
+    )
+    assert json.loads(inject_request.update[0].val.json_ietf_val) == {
+        "operation": "INJECT"
+    }
+    assert stub.calls[1][1].delete[0] == protobuf_path(fault_path("ocs0"))
+    assert injected["operations"][0]["operation"] == "UPDATE"
+    assert cleared["operations"][0]["operation"] == "DELETE"
 
 
 async def test_client_validates_deadline_batch_and_get_response_shape() -> None:
@@ -240,6 +259,7 @@ def test_cli_exposes_management_commands_and_has_no_redis_imports() -> None:
     assert "capabilities" in result.stdout
     assert "connection" in result.stdout
     assert "diagnostics" in result.stdout
+    assert "fault" in result.stdout
     assert connection_help.exit_code == 0
     for command in ("batch", "create", "delete", "list", "replace", "watch"):
         assert command in connection_help.stdout

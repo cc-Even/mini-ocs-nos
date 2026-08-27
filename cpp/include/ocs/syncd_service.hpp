@@ -30,6 +30,7 @@ public:
         const std::string& consumer_name,
         const std::function<void()>& before_ack = {},
         const std::function<void(std::string_view)>& after_phase = {});
+    [[nodiscard]] bool processFaultOne(const std::string& consumer_name);
 
 private:
     [[nodiscard]] bool isAlreadyProcessed(const redis::EventEnvelope& command_event);

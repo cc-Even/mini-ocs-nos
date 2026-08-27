@@ -15,10 +15,16 @@ deadlines and polling rather than relying on one short fixed sleep.
 | `make image` | All pinned, non-root service image targets | Docker daemon |
 | `make up` | Complete dependency-gated runtime health | Docker daemon; localhost port 50051 |
 | `make e2e` | Fresh isolated Compose stack controlled only through gNMI | Docker daemon; localhost port 50052 by default |
+| `make demo` | Guided operator flow, managed fault/recovery, diagnostics, and packaged E2E | Docker daemon; localhost ports 50053 and 50052 by default |
 
 Run `make down` after manual Compose use. The integration and E2E harnesses have
 their own cleanup traps. The E2E project name and port can be overridden with
 `OCS_E2E_PROJECT_NAME` and `OCS_E2E_GNMI_PORT`.
+
+`make demo` uses its own Compose project, enables the otherwise closed simulator
+fault API only inside that stack, stores logs below `artifacts/demo/`, and
+removes its containers, networks, and volumes on exit. Override its project and
+port with `OCS_DEMO_PROJECT_NAME` and `OCS_DEMO_GNMI_PORT`.
 
 ## Test layers
 
@@ -45,7 +51,9 @@ Redis container. The integration command selects those tests explicitly.
 - Get typing/filtering and missing-resource behavior;
 - Subscribe snapshot/sync/change/delete ordering and cancellation;
 - `ocsctl` deadlines, batch validation, ACTIVE waiting, malformed replies, and
-  absence of a Redis dependency.
+  absence of a Redis dependency;
+- default-closed fault authorization, strict fault payload/path validation, and
+  confirmed reliable command results.
 
 Real-Redis and Compose-marked pytest cases skip in the default run and execute
 under their dedicated harnesses.
@@ -66,6 +74,16 @@ only the published gNMI endpoint. It creates three connections, waits for
 ACTIVE with matching versions/counters, then verifies that a conflicting
 two-member batch is atomically rejected and absent from both configuration and
 operational reads. Cleanup removes this test project's volumes.
+
+### Reproducible operator demo
+
+`make demo` starts an isolated full stack and uses only health commands and
+`ocsctl` at its management boundary. It captures a bounded ON_CHANGE stream,
+creates three ACTIVE circuits, proves a conflicting batch is rejected, injects
+a one-shot timeout, shows FAILED state plus alarm/counter evidence, clears the
+fault, waits for automatic ACTIVE recovery, prints diagnostics, and finishes
+with the packaged E2E suite. See [Demo](demo.md) and the current
+[test report](test-report.md).
 
 ## Scenario matrix
 
@@ -89,7 +107,7 @@ repository permissions:
 2. C++ configure, build, and CTest;
 3. ASan/UBSan unit and Redis integration runs;
 4. real Redis and service-process integration;
-5. full Compose build, health, and E2E.
+5. full Compose build, health, reproducible demo, and E2E.
 
 Failed jobs upload relevant logs for 14 days. Compose cleanup runs even when a
 job fails.

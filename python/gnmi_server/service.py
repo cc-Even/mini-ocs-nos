@@ -10,6 +10,11 @@ import grpc
 
 from gnmi_server import __version__
 from gnmi_server.errors import abort_rpc
+from gnmi_server.fault_transaction import (
+    FaultTransaction,
+    RedisFaultRepository,
+    is_fault_request,
+)
 from gnmi_server.get_repository import RedisGetRepository
 from gnmi_server.get_transaction import GetTransaction
 from gnmi_server.proto import gnmi_pb2, gnmi_pb2_grpc
@@ -32,18 +37,21 @@ class GnmiService(gnmi_pb2_grpc.gNMIServicer):
         set_transaction: SetTransaction | None = None,
         get_transaction: GetTransaction | None = None,
         subscribe_transaction: SubscribeTransaction | None = None,
+        fault_transaction: FaultTransaction | None = None,
     ) -> None:
         self._set_transaction = set_transaction or SetTransaction(RedisConfigRepository())
         self._get_transaction = get_transaction or GetTransaction(RedisGetRepository())
         self._subscribe_transaction = subscribe_transaction or SubscribeTransaction(
             RedisSubscribeRepository()
         )
+        self._fault_transaction = fault_transaction or FaultTransaction(RedisFaultRepository())
 
     async def close(self) -> None:
         await asyncio.gather(
             self._set_transaction.close(),
             self._get_transaction.close(),
             self._subscribe_transaction.close(),
+            self._fault_transaction.close(),
         )
 
     async def Capabilities(
@@ -81,7 +89,12 @@ class GnmiService(gnmi_pb2_grpc.gNMIServicer):
         context: grpc.aio.ServicerContext,
     ) -> gnmi_pb2.SetResponse:
         try:
-            result = await self._set_transaction.apply(request)
+            transaction = (
+                self._fault_transaction
+                if is_fault_request(request)
+                else self._set_transaction
+            )
+            result = await transaction.apply(request)
         except Exception as error:
             await abort_rpc(context, error)
             raise AssertionError("gRPC abort returned unexpectedly") from error

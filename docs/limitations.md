@@ -24,19 +24,21 @@ production network operating system or hardware implementation.
 - Redis persistence is a local named volume and is not configured for HA,
   encryption, authenticated remote access, backup, or disaster recovery.
 - Fault control is local test infrastructure and must not be exposed to an
-  untrusted network. The public gNMI API has no fault/reset endpoint.
+  untrusted network. Its gNMI subtree is disabled unless the server starts with
+  the explicit `OCS_ENABLE_FAULT_API=1` development flag.
 
 ## Management and operations
 
 - `ocsctl` supports Capabilities, device/port/connection reads, connection
-  create/replace/batch/delete/watch, alarms, counters, diagnostics, and raw Get.
-  It does not yet support `fault inject`, `fault clear`, or a diagnostics bundle.
-- `ocs-hwsimctl` is an internal UDS helper and currently exposes only input and
-  output port DOWN/clear plus health. Other deterministic faults are invoked by
-  test fixtures through the device abstraction.
-- The automated operator demo, consolidated test report, and two-minute video
-  script are separate Phase 5 follow-up deliverables. The current Makefile has
-  no `demo` target.
+  create/replace/batch/delete/watch, alarms, counters, diagnostics, raw Get, and
+  explicitly enabled simulator fault injection/clear. It does not provide a
+  downloadable diagnostics bundle.
+- Managed simulator faults cover next-apply timeout/error and input/output port
+  DOWN. Out-of-band drift, crash points, and process restarts remain automated
+  fixture controls; `ocs-hwsimctl` remains an internal local UDS helper.
+- `make demo` and the consolidated test report are implemented. The interactive
+  web gateway and dashboard remain Iterations 54 and 55; there is no current
+  web-development target.
 - Logs are structured and collected on test failure, but there is no centralized
   log service, metrics exporter, dashboard, tracing system, or alert receiver.
 

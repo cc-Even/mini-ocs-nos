@@ -29,6 +29,13 @@ def connection_path(device: str, connection_id: str, leaf: str = "") -> str:
     )
 
 
+def fault_path(device: str, fault_id: str = "", leaf: str = "") -> str:
+    suffix = f"/fault[id={fault_id}]" if fault_id else ""
+    if leaf:
+        suffix += f"/{leaf}"
+    return f"/ocs/devices/device[name={device}]/faults{suffix}"
+
+
 def _path_text(path: gnmi_pb2.Path) -> str:
     segments: list[str] = []
     for element in path.elem:
@@ -138,6 +145,32 @@ class GnmiClient:
             ],
         }
 
+    async def inject_fault(self, device: str, fault_id: str) -> dict[str, Any]:
+        payload = json.dumps({"operation": "INJECT"}, separators=(",", ":")).encode()
+        response = await self._stub.Set(
+            gnmi_pb2.SetRequest(
+                update=[
+                    gnmi_pb2.Update(
+                        path=protobuf_path(fault_path(device, fault_id, "config")),
+                        val=gnmi_pb2.TypedValue(json_ietf_val=payload),
+                    )
+                ]
+            ),
+            timeout=self.timeout_seconds,
+        )
+        return self._set_response(response)
+
+    async def clear_fault(
+        self, device: str, fault_id: str | None = None
+    ) -> dict[str, Any]:
+        response = await self._stub.Set(
+            gnmi_pb2.SetRequest(
+                delete=[protobuf_path(fault_path(device, fault_id or ""))]
+            ),
+            timeout=self.timeout_seconds,
+        )
+        return self._set_response(response)
+
     async def wait_for_connection(
         self,
         device: str,
@@ -217,3 +250,16 @@ class GnmiClient:
             path=protobuf_path(connection_path(device, connection.connection_id, "config")),
             val=gnmi_pb2.TypedValue(json_ietf_val=payload),
         )
+
+    @staticmethod
+    def _set_response(response: gnmi_pb2.SetResponse) -> dict[str, Any]:
+        return {
+            "timestamp": response.timestamp,
+            "operations": [
+                {
+                    "path": _path_text(result.path),
+                    "operation": gnmi_pb2.UpdateResult.Operation.Name(result.op),
+                }
+                for result in response.response
+            ],
+        }

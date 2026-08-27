@@ -42,6 +42,11 @@ from gnmi_server.proto import gnmi_pb2
         ),
         ("/ocs/devices/device[name=ocs0]/counters", PathKind.COUNTERS),
         ("/ocs/devices/device[name=ocs0]/diagnostics", PathKind.DIAGNOSTICS),
+        ("/ocs/devices/device[name=ocs0]/faults", PathKind.FAULTS),
+        (
+            "/ocs/devices/device[name=ocs0]/faults/fault[id=next-apply-timeout]/config",
+            PathKind.FAULT_CONFIG,
+        ),
     ],
 )
 def test_parse_supported_native_paths(path: str, kind: PathKind) -> None:

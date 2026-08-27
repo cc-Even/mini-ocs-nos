@@ -14,6 +14,7 @@ DEVICE_RESULTS: Final = "OCS_DEVICE_RESULTS"
 DEVICE_RETRIES: Final = "OCS_DEVICE_RETRIES"
 STATE_EVENTS: Final = "OCS_STATE_EVENTS"
 ALARM_EVENTS: Final = "OCS_ALARM_EVENTS"
+FAULT_COMMANDS: Final = "OCS_FAULT_COMMANDS"
 
 
 def device_config_key(device: str) -> str:
@@ -94,3 +95,7 @@ def active_alarm_key(device: str, alarm_id: str) -> str:
 
 def active_alarm_pattern(device: str) -> str:
     return f"OCS_ACTIVE_ALARM|{device}|*"
+
+
+def fault_result_key(command_id: str) -> str:
+    return f"OCS_FAULT_RESULT|{command_id}"

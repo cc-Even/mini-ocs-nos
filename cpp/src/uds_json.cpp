@@ -70,6 +70,8 @@ std::string_view faultName(FaultType type) {
             return "OUTPUT_PORT_DOWN";
         case FaultType::kOutOfBandDrift:
             return "OUT_OF_BAND_DRIFT";
+        case FaultType::kAll:
+            return "ALL";
     }
     return "NEXT_APPLY_ERROR";
 }
@@ -86,6 +88,9 @@ FaultType parseFault(std::string_view value) {
     }
     if (value == "OUT_OF_BAND_DRIFT") {
         return FaultType::kOutOfBandDrift;
+    }
+    if (value == "ALL") {
+        return FaultType::kAll;
     }
     return FaultType::kNextApplyError;
 }

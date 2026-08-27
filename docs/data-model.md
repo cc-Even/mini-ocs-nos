@@ -25,6 +25,7 @@ and paths outside this schema.
 | Active alarms | `/ocs/devices/device[name=ocs0]/alarms` | Get, Subscribe |
 | Counters | `/ocs/devices/device[name=ocs0]/counters` | Get |
 | Diagnostics | `/ocs/devices/device[name=ocs0]/diagnostics` | Get |
+| Development fault | `.../faults/fault[id=next-apply-timeout]/config` | Set when explicitly enabled |
 
 A connection config contains `id`, `input-port`, and `output-port`. Reads return
 kebab-case JSON fields and numeric/boolean JSON types rather than Redis strings.
@@ -32,6 +33,14 @@ Get supports ALL, CONFIG, STATE, and OPERATIONAL filtering where meaningful.
 Subscribe supports STREAM with ON_CHANGE or TARGET_DEFINED for connection,
 port, and alarm state; SAMPLE, ONCE, POLL, heartbeat, QoS, and aggregation are
 outside the MVP.
+
+The fault subtree is not readable state and is disabled by default. When
+`OCS_ENABLE_FAULT_API=1`, one update with JSON_IETF
+`{"operation":"INJECT"}` injects a supported keyed fault; deleting a keyed
+fault clears it, and deleting `/faults` clears all simulator faults. A fault Set
+cannot be mixed with connection operations. Supported IDs are
+`next-apply-timeout`, `next-apply-error`, `input-port-down-N`, and
+`output-port-down-N`.
 
 ## Redis logical databases
 

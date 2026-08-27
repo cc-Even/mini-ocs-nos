@@ -105,7 +105,7 @@ jobs:
             docker compose config --quiet
             make up
             docker compose ps
-            make e2e
+            make demo
           } 2>&1 | tee artifacts/test-logs/compose-runtime/acceptance.log
       - if: always()
         run: docker compose logs --no-color > artifacts/test-logs/compose-runtime/services.log 2>&1 || true

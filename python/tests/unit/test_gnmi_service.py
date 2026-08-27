@@ -84,3 +84,22 @@ async def test_invalid_set_path_maps_to_invalid_argument(gnmi_stub) -> None:
 
     assert raised.value.code() is grpc.StatusCode.INVALID_ARGUMENT
     assert raised.value.details().startswith("invalid path:")
+
+
+async def test_fault_set_is_default_closed(gnmi_stub) -> None:
+    path = protobuf_path(
+        "/ocs/devices/device[name=ocs0]/faults/fault[id=next-apply-timeout]/config"
+    )
+    request = gnmi_pb2.SetRequest(
+        update=[
+            gnmi_pb2.Update(
+                path=path,
+                val=gnmi_pb2.TypedValue(json_ietf_val=b'{"operation":"INJECT"}'),
+            )
+        ]
+    )
+
+    with pytest.raises(grpc.aio.AioRpcError) as raised:
+        await gnmi_stub.Set(request, timeout=1.0)
+
+    assert raised.value.code() is grpc.StatusCode.PERMISSION_DENIED

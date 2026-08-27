@@ -19,12 +19,14 @@ connection_app = typer.Typer(no_args_is_help=True)
 alarm_app = typer.Typer(no_args_is_help=True)
 counters_app = typer.Typer(no_args_is_help=True)
 diagnostics_app = typer.Typer(no_args_is_help=True)
+fault_app = typer.Typer(no_args_is_help=True)
 app.add_typer(device_app, name="device")
 app.add_typer(port_app, name="port")
 app.add_typer(connection_app, name="connection")
 app.add_typer(alarm_app, name="alarm")
 app.add_typer(counters_app, name="counters")
 app.add_typer(diagnostics_app, name="diagnostics")
+app.add_typer(fault_app, name="fault")
 
 
 @dataclass(frozen=True)
@@ -270,6 +272,61 @@ def diagnostics_show(context: typer.Context, device: str) -> None:
         _run(_get(settings, f"/ocs/devices/device[name={device}]/diagnostics")),
         settings,
     )
+
+
+def _fault_id(fault: str, port: int | None) -> str:
+    normalized = fault.lower().replace("_", "-")
+    if normalized in {"next-apply-timeout", "next-apply-error"}:
+        if port is not None:
+            raise typer.BadParameter(f"{normalized} does not accept --port")
+        return normalized
+    if normalized in {"input-port-down", "output-port-down"}:
+        if port is None or port <= 0:
+            raise typer.BadParameter(f"{normalized} requires a positive --port")
+        return f"{normalized}-{port}"
+    raise typer.BadParameter(f"unsupported simulator fault {fault!r}")
+
+
+@fault_app.command("inject")
+def fault_inject(
+    context: typer.Context,
+    device: str,
+    fault: str,
+    port: Annotated[int | None, typer.Option("--port", min=1)] = None,
+) -> None:
+    """Inject a development-only simulator fault through gNMI and syncd."""
+
+    settings: CliSettings = context.obj
+
+    async def operation():
+        async with GnmiClient(settings.target, timeout_seconds=settings.timeout_seconds) as client:
+            return await client.inject_fault(device, _fault_id(fault, port))
+
+    _emit(_run(operation()), settings)
+
+
+@fault_app.command("clear")
+def fault_clear(
+    context: typer.Context,
+    device: str,
+    all_faults: Annotated[bool, typer.Option("--all")] = False,
+    fault: Annotated[str | None, typer.Option("--fault")] = None,
+    port: Annotated[int | None, typer.Option("--port", min=1)] = None,
+) -> None:
+    """Clear all faults or one selected development-only simulator fault."""
+
+    if all_faults == (fault is not None):
+        raise typer.BadParameter("select exactly one of --all or --fault")
+    if all_faults and port is not None:
+        raise typer.BadParameter("--all does not accept --port")
+    fault_id = None if all_faults else _fault_id(str(fault), port)
+    settings: CliSettings = context.obj
+
+    async def operation():
+        async with GnmiClient(settings.target, timeout_seconds=settings.timeout_seconds) as client:
+            return await client.clear_fault(device, fault_id)
+
+    _emit(_run(operation()), settings)
 
 
 @app.command("get")

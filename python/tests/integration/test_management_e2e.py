@@ -10,6 +10,7 @@ from pathlib import Path
 
 import grpc
 import pytest
+from gnmi_server.fault_transaction import FaultTransaction, RedisFaultRepository
 from gnmi_server.get_repository import RedisGetRepository
 from gnmi_server.get_transaction import GetTransaction
 from gnmi_server.redis_keys import CONFIG_DB, STATE_DB, device_config_key, service_state_key
@@ -183,6 +184,7 @@ async def test_scenarios_a_b_and_h_through_ocsctl_and_gnmi(tmp_path: Path) -> No
         SetTransaction(RedisConfigRepository(settings)),
         GetTransaction(RedisGetRepository(settings)),
         SubscribeTransaction(RedisSubscribeRepository(settings)),
+        FaultTransaction(RedisFaultRepository(settings, enabled=True)),
     )
     server, port = create_server("127.0.0.1:0", service)
     await server.start()
@@ -263,17 +265,16 @@ async def test_scenarios_a_b_and_h_through_ocsctl_and_gnmi(tmp_path: Path) -> No
             assert initial_port["value"]["oper-status"] == "UP"
             assert await anext(notifications) == {"sync-response": True}
 
-            fault = await asyncio.create_subprocess_exec(
-                executable_root / "ocs-hwsimctl",
-                hwsim_socket,
+            code, _, stderr = await _run_cli(
+                target,
+                "fault",
                 "inject",
-                "INPUT_PORT_DOWN",
+                "ocs0",
+                "input-port-down",
+                "--port",
                 "3",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
             )
-            fault_stdout, fault_stderr = await fault.communicate()
-            assert fault.returncode == 0, (fault_stdout + fault_stderr).decode()
+            assert code == 0, stderr
             down = await asyncio.wait_for(anext(notifications), timeout=5.0)
             assert down["value"]["oper-status"] == "DOWN"
 
@@ -291,17 +292,8 @@ async def test_scenarios_a_b_and_h_through_ocsctl_and_gnmi(tmp_path: Path) -> No
             assert alarm["active"] is True
             assert alarm["affected-connection-count"] == 1
 
-            clear = await asyncio.create_subprocess_exec(
-                executable_root / "ocs-hwsimctl",
-                hwsim_socket,
-                "clear",
-                "INPUT_PORT_DOWN",
-                "3",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            clear_stdout, clear_stderr = await clear.communicate()
-            assert clear.returncode == 0, (clear_stdout + clear_stderr).decode()
+            code, _, stderr = await _run_cli(target, "fault", "clear", "ocs0", "--all")
+            assert code == 0, stderr
             up = await asyncio.wait_for(anext(notifications), timeout=5.0)
             assert up["value"]["oper-status"] == "UP"
             await notifications.aclose()

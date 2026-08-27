@@ -117,6 +117,31 @@ empty, while the same container below a missing device returns `NOT_FOUND`.
 Malformed paths, incompatible Get types, unsupported models, and encodings other
 than JSON_IETF return `INVALID_ARGUMENT` before Redis is read.
 
+## Managed simulator fault commands
+
+The development-only gNMI fault transaction is disabled by default. When
+`OCS_ENABLE_FAULT_API=1`, it validates exactly one inject or clear operation and
+appends a v1 `fault` envelope to `OCS_FAULT_COMMANDS` in DEVICE_DB. Its payload
+contains `fault_type`, matching `operation`, and numeric `port_id`. Managed
+types are `NEXT_APPLY_TIMEOUT`, `NEXT_APPLY_ERROR`, `INPUT_PORT_DOWN`,
+`OUTPUT_PORT_DOWN`, and clear-only `ALL`.
+
+syncd consumes this stream through the `ocs-syncd-faults` group with the same
+bounded pending-first ordering used by device work. It validates the device and
+payload, executes the command through `UdsDeviceBackend`, then creates
+`OCS_FAULT_RESULT|event-id` exactly once with `success`, stable error fields,
+device, command ID, and completion timestamp before ACK. A redelivered command
+with a recorded result only ACKs. A crash between the device call and result
+write can replay the command, so the managed set is deliberately limited to
+idempotent flag/port-state operations. The gNMI server polls for the confirmed
+result within its bounded transaction deadline; Redis/UDS dependency errors
+never become false success.
+
+These hashes are recovery/idempotency records, not configuration or operational
+state. `ocsctl` and the future web gateway do not access them directly, and the
+non-idempotent `OUT_OF_BAND_DRIFT` fixture is intentionally not accepted by
+this stream.
+
 ## Device synchronization contract
 
 `ocs-syncd` consumes `OCS_DEVICE_COMMANDS` in DEVICE_DB through the

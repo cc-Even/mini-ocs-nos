@@ -161,6 +161,49 @@ TEST_F(SyncdIntegrationTest, AppliesCommandPublishesStateAndResultThenAcknowledg
     EXPECT_EQ(device_db_->pendingCount(std::string(ocs::redis::kDeviceCommands), "ocs-syncd"), 0);
 }
 
+TEST_F(SyncdIntegrationTest, ProcessesReliableManagedFaultCommandsThroughUds) {
+    const auto append_fault = [this](
+                                  std::string event_id,
+                                  std::string operation,
+                                  std::string fault_type) {
+        const ocs::redis::EventEnvelope event{
+            .event_schema_version = 1,
+            .event_id = std::move(event_id),
+            .request_id = "request-fault-53",
+            .timestamp_ns = 1780000000000000053ULL,
+            .device = "ocs0",
+            .resource_type = "fault",
+            .resource_id = "managed-fault",
+            .operation = operation,
+            .desired_version = 0,
+            .payload = "{\"fault_type\":\"" + fault_type + "\",\"operation\":\"" +
+                       operation + "\",\"port_id\":0}",
+        };
+        static_cast<void>(device_db_->appendEvent(
+            std::string(ocs::redis::kFaultCommands), event));
+        ASSERT_TRUE(syncd_->processFaultOne("fault-consumer"));
+        const auto result = device_db_->getHash(ocs::redis::faultResultKey(event.event_id));
+        EXPECT_EQ(result.at("success"), "true");
+        EXPECT_EQ(
+            device_db_->pendingCount(
+                std::string(ocs::redis::kFaultCommands), "ocs-syncd-faults"),
+            0);
+    };
+
+    append_fault("fault-inject-53", "INJECT", "NEXT_APPLY_TIMEOUT");
+    const auto timed_out = simulated_device_->applyConnections(
+        {{.id = "timeout", .input_port = 6, .output_port = 13, .desired_version = 1}}, {});
+    EXPECT_EQ(timed_out.error.code, ocs::ErrorCode::kApplyTimeout);
+
+    append_fault("fault-inject-clear-53", "INJECT", "NEXT_APPLY_TIMEOUT");
+    append_fault("fault-clear-53", "CLEAR", "ALL");
+    EXPECT_TRUE(
+        simulated_device_
+            ->applyConnections(
+                {{.id = "cleared", .input_port = 6, .output_port = 13, .desired_version = 1}}, {})
+            .ok());
+}
+
 TEST_F(SyncdIntegrationTest, ConfirmsCreateUpdateAndDeleteAfterApplyReplyIsLost) {
     const std::string result_group = "lost-reply-results";
     device_db_->createConsumerGroup(std::string(ocs::redis::kDeviceResults), result_group);

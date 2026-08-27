@@ -23,6 +23,10 @@ inline constexpr std::string_view kStateEvents = "OCS_STATE_EVENTS";
 inline constexpr std::string_view kAlarmEvents = "OCS_ALARM_EVENTS";
 inline constexpr std::string_view kFaultCommands = "OCS_FAULT_COMMANDS";
 
+[[nodiscard]] inline std::string faultResultKey(std::string_view command_id) {
+    return "OCS_FAULT_RESULT|" + std::string(command_id);
+}
+
 [[nodiscard]] inline std::string deviceConfigKey(std::string_view device) {
     return "OCS_DEVICE|" + std::string(device);
 }

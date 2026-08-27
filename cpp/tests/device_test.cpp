@@ -345,4 +345,21 @@ TEST(InProcessSimBackendTest, InjectsOutOfBandDriftWithoutChangingDesiredVersion
     EXPECT_EQ(backend->getConnections().front().applied_version, 7);
 }
 
+TEST(InProcessSimBackendTest, ClearAllFaultsRestoresPortsAndOneShotFlags) {
+    auto backend = makeBackend();
+    ASSERT_TRUE(backend->injectFault({.type = ocs::FaultType::kNextApplyTimeout}).error.ok());
+    ASSERT_TRUE(
+        backend->injectFault({.type = ocs::FaultType::kInputPortDown, .port_id = 3}).error.ok());
+
+    ASSERT_TRUE(backend->clearFault({.type = ocs::FaultType::kAll}).error.ok());
+
+    EXPECT_EQ(backend->getInputPortState(3).oper_status, ocs::PortOperStatus::kUp);
+    EXPECT_TRUE(
+        backend
+            ->applyConnections(
+                {{.id = "after-clear", .input_port = 3, .output_port = 11, .desired_version = 1}},
+                {})
+            .ok());
+}
+
 }  // namespace

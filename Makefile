@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := build
 
-.PHONY: bootstrap configure build cpp-test sanitizer-test sanitizer-integration-test generate-protos python-sync python-test lint test image up redis-test redis-integration-test e2e down
+.PHONY: bootstrap configure build cpp-test sanitizer-test sanitizer-integration-test generate-protos python-sync python-test lint test image up redis-test redis-integration-test e2e demo down
 
 bootstrap:
 	./scripts/bootstrap.sh
@@ -57,6 +57,9 @@ redis-integration-test: build
 
 e2e: python-sync
 	./scripts/test-compose-e2e.sh
+
+demo: python-sync
+	./scripts/demo.sh
 
 down:
 	docker compose down

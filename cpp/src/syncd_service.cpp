@@ -23,6 +23,7 @@ namespace ocs {
 namespace {
 
 inline constexpr std::string_view kConsumerGroup = "ocs-syncd";
+inline constexpr std::string_view kFaultConsumerGroup = "ocs-syncd-faults";
 
 std::uint64_t timestampNowNs() {
     return static_cast<std::uint64_t>(
@@ -147,6 +148,25 @@ bool portUnavailable(const PortState& port) {
     return !port.admin_enabled || port.oper_status != PortOperStatus::kUp;
 }
 
+FaultType managedFaultType(std::string_view value) {
+    if (value == "NEXT_APPLY_ERROR") {
+        return FaultType::kNextApplyError;
+    }
+    if (value == "NEXT_APPLY_TIMEOUT") {
+        return FaultType::kNextApplyTimeout;
+    }
+    if (value == "INPUT_PORT_DOWN") {
+        return FaultType::kInputPortDown;
+    }
+    if (value == "OUTPUT_PORT_DOWN") {
+        return FaultType::kOutputPortDown;
+    }
+    if (value == "ALL") {
+        return FaultType::kAll;
+    }
+    throw std::invalid_argument("unsupported managed fault type");
+}
+
 }  // namespace
 
 SyncdService::SyncdService(
@@ -170,6 +190,8 @@ SyncdService::SyncdService(
 
 void SyncdService::initialize() {
     device_db_.createConsumerGroup(std::string(redis::kDeviceCommands), std::string(kConsumerGroup));
+    device_db_.createConsumerGroup(
+        std::string(redis::kFaultCommands), std::string(kFaultConsumerGroup));
     const auto info = device_->getDeviceInfo();
     const std::map<std::string, std::string> inventory{
         {"name", info.name},
@@ -236,6 +258,94 @@ void SyncdService::initialize() {
             publishDeviceState(info, actual.size(), "READY", Error::success());
         }
     }
+}
+
+bool SyncdService::processFaultOne(const std::string& consumer_name) {
+    auto messages = device_db_.claimPending(
+        std::string(redis::kFaultCommands),
+        std::string(kFaultConsumerGroup),
+        consumer_name,
+        pending_min_idle_,
+        1);
+    if (messages.empty()) {
+        messages = device_db_.readGroupIfNoPending(
+            std::string(redis::kFaultCommands),
+            std::string(kFaultConsumerGroup),
+            consumer_name);
+    }
+    if (messages.empty()) {
+        return false;
+    }
+
+    const auto& message = messages.front();
+    const auto result_key = redis::faultResultKey(message.event.event_id);
+    auto result_fields = device_db_.getHash(result_key);
+    if (result_fields.empty()) {
+        FaultResult result;
+        try {
+            if (message.event.resource_type != "fault" ||
+                (message.event.operation != "INJECT" && message.event.operation != "CLEAR")) {
+                throw std::invalid_argument("invalid fault command envelope");
+            }
+            const auto payload = nlohmann::json::parse(message.event.payload);
+            const auto operation = payload.at("operation").get<std::string>();
+            if (operation != message.event.operation) {
+                throw std::invalid_argument("fault payload operation does not match envelope");
+            }
+            const auto type = managedFaultType(payload.at("fault_type").get<std::string>());
+            const auto raw_port = payload.at("port_id").get<std::uint64_t>();
+            if (raw_port > std::numeric_limits<PortId>::max()) {
+                throw std::invalid_argument("fault port is outside the supported range");
+            }
+            if ((type == FaultType::kInputPortDown || type == FaultType::kOutputPortDown) &&
+                raw_port == 0) {
+                throw std::invalid_argument("port fault requires a positive port");
+            }
+            if (type == FaultType::kAll && operation != "CLEAR") {
+                throw std::invalid_argument("ALL is only valid for clear");
+            }
+            const auto info = device_->getDeviceInfo();
+            if (info.name != message.event.device) {
+                result.error = {
+                    ErrorCode::kDeviceNotReady,
+                    "fault device does not match the connected backend",
+                };
+            } else {
+                const FaultSpec fault{
+                    .type = type,
+                    .port_id = static_cast<PortId>(raw_port),
+                };
+                result = operation == "INJECT"
+                             ? device_->injectFault(fault)
+                             : device_->clearFault({.type = fault.type, .port_id = fault.port_id});
+            }
+        } catch (const nlohmann::json::exception& error) {
+            result.error = {ErrorCode::kProtocolMalformed, error.what()};
+        } catch (const std::invalid_argument& error) {
+            result.error = {ErrorCode::kInvalidArgument, error.what()};
+        } catch (const std::exception& error) {
+            result.error = {ErrorCode::kDeviceNotReady, error.what()};
+        }
+        static_cast<void>(device_db_.putHashIfAbsent(
+            result_key,
+            {
+                {"command_id", message.event.event_id},
+                {"device", message.event.device},
+                {"success", result.error.ok() ? "true" : "false"},
+                {"error_code", std::string(toString(result.error.code))},
+                {"error_message", result.error.message},
+                {"completed_at_ns", std::to_string(timestampNowNs())},
+            }));
+    }
+
+    const auto acknowledged = device_db_.acknowledge(
+        std::string(redis::kFaultCommands),
+        std::string(kFaultConsumerGroup),
+        message.id);
+    if (acknowledged != 1) {
+        throw std::runtime_error("syncd failed to acknowledge processed fault command");
+    }
+    return true;
 }
 
 bool SyncdService::pollDevice() {

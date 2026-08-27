@@ -201,6 +201,9 @@ ResetResult SimulatedOcsDevice::reset(ResetMode mode) {
 
 FaultResult SimulatedOcsDevice::injectFault(const FaultSpec& fault) {
     std::scoped_lock lock(mutex_);
+    if (fault.type == FaultType::kAll) {
+        return {makeError(ErrorCode::kInvalidArgument, "ALL is only valid when clearing faults")};
+    }
     if (fault.type == FaultType::kNextApplyError) {
         fail_next_apply_ = true;
         return {Error::success()};
@@ -232,6 +235,17 @@ FaultResult SimulatedOcsDevice::injectFault(const FaultSpec& fault) {
 
 FaultResult SimulatedOcsDevice::clearFault(const FaultSelector& selector) {
     std::scoped_lock lock(mutex_);
+    if (selector.type == FaultType::kAll) {
+        fail_next_apply_ = false;
+        timeout_next_apply_ = false;
+        for (auto& port : input_ports_) {
+            port.oper_status = PortOperStatus::kUp;
+        }
+        for (auto& port : output_ports_) {
+            port.oper_status = PortOperStatus::kUp;
+        }
+        return {Error::success()};
+    }
     if (selector.type == FaultType::kNextApplyError) {
         fail_next_apply_ = false;
         return {Error::success()};

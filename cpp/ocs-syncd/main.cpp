@@ -118,7 +118,9 @@ int main(int argc, char* argv[]) {
                     std::_Exit(86);
                 }
             };
-            if (!service.processOne("syncd-main", before_ack)) {
+            const auto processed_fault = service.processFaultOne("syncd-main-fault");
+            const auto processed_command = service.processOne("syncd-main", before_ack);
+            if (!processed_fault && !processed_command) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
         }

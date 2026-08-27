@@ -101,7 +101,7 @@ then clears port/drift alarms after confirmation.
 | E: syncd crash | Kill after durable completion before ACK, claim pending, side effects remain once-only |
 | F: UDS/hwsim restart | Reject unconfirmed update, detect new generation, refresh actual, recover current intent |
 | G: drift | Change simulator matrix only, observe drift lifecycle/alarm/counters, converge full snapshot |
-| H: port DOWN | Inject input and output faults over UDS, observe state/alarm/Subscribe DOWN/UP, converge after clear |
+| H: port DOWN | Inject input/output faults through the enabled gNMI development API, observe state/alarm/Subscribe DOWN/UP, converge after clear |
 
 These tests use a real Redis container, actual service processes where the
 scenario requires them, `UdsDeviceBackend`, and standalone hwsim. They do not
@@ -109,17 +109,22 @@ edit production-path Redis state to manufacture recovery.
 
 ## Fault injection boundary
 
-Fault injection is development/test-only and is not exposed on the public gNMI
-API. The built `ocs-hwsimctl` helper supports deterministic input/output port
-DOWN injection and clear against a local simulator socket:
+Fault injection is development/test-only. Its gNMI subtree is default-closed
+and returns `PERMISSION_DENIED` unless the server has
+`OCS_ENABLE_FAULT_API=1`. With that explicit flag, `ocsctl` supports bounded,
+confirmed commands through the same gNMI, reliable stream, syncd, and UDS
+boundaries used by the demo:
 
 ```bash
-build/dev/cpp/ocs-hwsimctl /tmp/mini-ocs/ocs-hwsim.sock inject INPUT_PORT_DOWN 3
-build/dev/cpp/ocs-hwsimctl /tmp/mini-ocs/ocs-hwsim.sock clear INPUT_PORT_DOWN 3
+ocsctl fault inject ocs0 next-apply-timeout
+ocsctl fault inject ocs0 input-port-down --port 3
+ocsctl fault clear ocs0 --all
 ```
 
-The automated C++ fixtures use the same device abstraction for next-apply
-timeout/error and out-of-band drift. Scenario E uses the test-only
-`OCS_SYNCD_CRASH_BEFORE_ACK_ONCE` process hook. Scenario F controls the
-standalone process lifecycle. There is currently no `ocsctl fault` command; see
+Managed injection covers one-shot apply timeout/error and input/output port
+DOWN. Clear-all also restores every simulated port to UP. The non-idempotent
+out-of-band drift control remains inside automated C++ fixtures. Scenario E
+uses the test-only `OCS_SYNCD_CRASH_BEFORE_ACK_ONCE` process hook, and scenario
+F controls the standalone process lifecycle. The local `ocs-hwsimctl` UDS
+helper remains available only to low-level tests; see
 [Known limitations](limitations.md).

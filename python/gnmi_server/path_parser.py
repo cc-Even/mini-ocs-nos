@@ -45,6 +45,9 @@ class PathKind(StrEnum):
     ALARM = "alarm"
     COUNTERS = "counters"
     DIAGNOSTICS = "diagnostics"
+    FAULTS = "faults"
+    FAULT = "fault"
+    FAULT_CONFIG = "fault-config"
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,7 @@ class NativePath:
     connection_id: str | None = None
     port_id: int | None = None
     alarm_id: str | None = None
+    fault_id: str | None = None
     origin: str = ""
     target: str = ""
 
@@ -204,6 +208,19 @@ def _canonical_path(
             assert alarm_id is not None
             return NativePath(PathKind.ALARM, alarm_id=alarm_id, **base)
         raise PathParseError("alarm paths may only end at alarms or a keyed alarm")
+    if branch == "faults":
+        _expect_element(elements[3], "faults")
+        if len(elements) == 4:
+            return NativePath(PathKind.FAULTS, **base)
+        fault_id = _expect_element(elements[4], "fault", "id")
+        assert fault_id is not None
+        fault_base = {**base, "fault_id": fault_id}
+        if len(elements) == 5:
+            return NativePath(PathKind.FAULT, **fault_base)
+        if len(elements) == 6:
+            _expect_element(elements[5], "config")
+            return NativePath(PathKind.FAULT_CONFIG, **fault_base)
+        raise PathParseError("fault paths may only end at fault or config")
     raise PathParseError(f"unsupported device branch {branch!r}")
 
 

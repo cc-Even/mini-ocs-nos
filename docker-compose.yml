@@ -55,6 +55,8 @@ services:
     environment:
       OCS_REDIS_HOST: redis
       OCS_REDIS_PORT: "6379"
+      OCS_ORCH_APPLY_RETRY_BASE_MS: "${OCS_ORCH_APPLY_RETRY_BASE_MS:-100}"
+      OCS_ORCH_APPLY_RETRY_MAX_MS: "${OCS_ORCH_APPLY_RETRY_MAX_MS:-5000}"
     depends_on:
       redis:
         condition: service_healthy
@@ -102,6 +104,7 @@ services:
     environment:
       OCS_REDIS_HOST: redis
       OCS_REDIS_PORT: "6379"
+      OCS_ENABLE_FAULT_API: "${OCS_ENABLE_FAULT_API:-0}"
     depends_on:
       ocs-orch:
         condition: service_healthy
