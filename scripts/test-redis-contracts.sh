@@ -17,6 +17,8 @@ readonly REDIS_RUNTIME_DIR
 chmod 0733 "${REDIS_RUNTIME_DIR}"
 mkdir -p "${TEST_LOG_DIR}"
 export OCS_REDIS_RUNTIME_DIR="${REDIS_RUNTIME_DIR}"
+export OCS_REDIS_RUNTIME_SOURCE="${REDIS_RUNTIME_DIR}"
+export OCS_REDIS_CONFIG_PATH="./config/redis.conf"
 export OCS_TEST_LOG_DIR="${TEST_LOG_DIR}"
 
 cleanup() {

@@ -1,6 +1,7 @@
 #include "ocs/connection_state_machine.hpp"
 #include "ocs/device_command.hpp"
 #include "ocs/errors.hpp"
+#include "ocs/redis_repository.hpp"
 
 #include <gtest/gtest.h>
 
@@ -141,6 +142,36 @@ TEST(DeviceCommandContractTest, RejectsInvalidOperationTimeoutAndEmptyBatch) {
              R"({"commands":[],"atomic":true,"timeout_ms":1})",
          }) {
         EXPECT_THROW(static_cast<void>(ocs::decodeDeviceCommand(payload)), std::invalid_argument);
+    }
+}
+
+TEST(RedisEndpointContractTest, ParsesUnixAndTcpTargets) {
+    const auto legacy_unix = ocs::redis::parseRedisEndpoint("/run/mini-ocs/redis.sock");
+    EXPECT_EQ(legacy_unix.unix_socket, "/run/mini-ocs/redis.sock");
+
+    const auto unix_uri = ocs::redis::parseRedisEndpoint("unix:///tmp/redis.sock");
+    EXPECT_EQ(unix_uri.unix_socket, "/tmp/redis.sock");
+
+    const auto tcp = ocs::redis::parseRedisEndpoint("tcp://redis:6380");
+    EXPECT_EQ(tcp.host, "redis");
+    EXPECT_EQ(tcp.port, 6380);
+    EXPECT_TRUE(tcp.unix_socket.empty());
+}
+
+TEST(RedisEndpointContractTest, RejectsMalformedOrUnboundedTargets) {
+    for (const auto* target : {
+             "redis:6379",
+             "tcp://:6379",
+             "tcp://redis",
+             "tcp://redis:0",
+             "tcp://redis:65536",
+             "tcp://redis:not-a-port",
+             "unix://relative.sock",
+         }) {
+        EXPECT_THROW(
+            static_cast<void>(ocs::redis::parseRedisEndpoint(target)),
+            std::invalid_argument)
+            << target;
     }
 }
 

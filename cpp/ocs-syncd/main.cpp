@@ -83,15 +83,14 @@ void publishProcessHeartbeat(
 
 int main(int argc, char* argv[]) {
     if (argc != 3) {
-        std::cerr << "usage: ocs-syncd REDIS_SOCKET HWSIM_SOCKET\n";
+        std::cerr << "usage: ocs-syncd REDIS_ENDPOINT HWSIM_SOCKET\n";
         return 2;
     }
     std::signal(SIGINT, stopHandler);
     std::signal(SIGTERM, stopHandler);
 
     try {
-        ocs::redis::RedisEndpoint endpoint;
-        endpoint.unix_socket = argv[1];
+        auto endpoint = ocs::redis::parseRedisEndpoint(argv[1]);
         std::jthread heartbeat(publishProcessHeartbeat, endpoint);
         auto backend = std::make_unique<ocs::UdsDeviceBackend>(argv[2]);
         ocs::SyncdService service(

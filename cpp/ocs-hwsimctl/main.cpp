@@ -20,8 +20,27 @@ ocs::FaultType faultType(std::string_view value) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+    if (argc == 3 && std::string_view(argv[2]) == "health") {
+        try {
+            ocs::UdsDeviceBackend backend(argv[1]);
+            const auto info = backend.getDeviceInfo();
+            const auto health = backend.getHealth();
+            if (health.status != ocs::DeviceOperStatus::kReady || !health.last_error.ok() ||
+                info.generation == 0) {
+                std::cerr << "ocs-hwsim is not ready\n";
+                return 1;
+            }
+            std::cout << "READY device=" << info.name << " generation=" << info.generation
+                      << '\n';
+            return 0;
+        } catch (const std::exception& error) {
+            std::cerr << "ocs-hwsimctl health failed: " << error.what() << '\n';
+            return 1;
+        }
+    }
     if (argc != 5) {
-        std::cerr << "usage: ocs-hwsimctl HWSIM_SOCKET inject|clear FAULT PORT_ID\n";
+        std::cerr << "usage: ocs-hwsimctl HWSIM_SOCKET health\n"
+                     "       ocs-hwsimctl HWSIM_SOCKET inject|clear FAULT PORT_ID\n";
         return 2;
     }
     try {

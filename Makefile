@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := build
 
-.PHONY: bootstrap configure build cpp-test sanitizer-test sanitizer-integration-test generate-protos python-sync python-test lint test up redis-test redis-integration-test down
+.PHONY: bootstrap configure build cpp-test sanitizer-test sanitizer-integration-test generate-protos python-sync python-test lint test image up redis-test redis-integration-test e2e down
 
 bootstrap:
 	./scripts/bootstrap.sh
@@ -43,14 +43,20 @@ lint: python-sync
 
 test: cpp-test python-test lint
 
+image:
+	docker compose build
+
 up:
-	docker compose up -d --wait redis
+	docker compose up -d --build --wait
 
 redis-test:
 	test "$$(docker compose exec -T redis redis-cli ping)" = "PONG"
 
 redis-integration-test: build
 	./scripts/test-redis-contracts.sh
+
+e2e: python-sync
+	./scripts/test-compose-e2e.sh
 
 down:
 	docker compose down

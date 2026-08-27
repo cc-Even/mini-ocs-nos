@@ -47,15 +47,14 @@ ocs::ApplyRetryPolicy retryPolicy() {
 
 int main(int argc, char* argv[]) {
     if (argc != 2) {
-        std::cerr << "usage: ocs-orch REDIS_SOCKET\n";
+        std::cerr << "usage: ocs-orch REDIS_ENDPOINT\n";
         return 2;
     }
     std::signal(SIGINT, stopHandler);
     std::signal(SIGTERM, stopHandler);
 
     try {
-        ocs::redis::RedisEndpoint endpoint;
-        endpoint.unix_socket = argv[1];
+        auto endpoint = ocs::redis::parseRedisEndpoint(argv[1]);
         ocs::OrchestratorService service(
             std::move(endpoint), std::chrono::seconds(5), retryPolicy());
         service.initialize();

@@ -88,25 +88,31 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  runtime-foundation:
+  compose-runtime:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: mkdir -p artifacts/test-logs/runtime-foundation
-      - name: Validate and start the Redis foundation
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.1"
+          python-version: "3.12"
+          enable-cache: true
+      - run: mkdir -p artifacts/test-logs/compose-runtime
+      - name: Build and verify the complete Compose runtime
         run: |
           set -o pipefail
           {
             docker compose config --quiet
-            docker compose up -d --wait redis
-            test "$(docker compose exec -T redis redis-cli ping)" = "PONG"
-          } 2>&1 | tee artifacts/test-logs/runtime-foundation/acceptance.log
+            make up
+            docker compose ps
+            make e2e
+          } 2>&1 | tee artifacts/test-logs/compose-runtime/acceptance.log
       - if: always()
-        run: docker compose logs --no-color > artifacts/test-logs/runtime-foundation/redis.log 2>&1 || true
+        run: docker compose logs --no-color > artifacts/test-logs/compose-runtime/services.log 2>&1 || true
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: runtime-foundation-failure-logs
+          name: compose-runtime-failure-logs
           path: artifacts/test-logs
           if-no-files-found: warn
           retention-days: 14

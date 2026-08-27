@@ -1,5 +1,16 @@
 name: mini-ocs-nos
 
+x-service-defaults: &service-defaults
+  init: true
+  restart: unless-stopped
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  networks:
+    - control-plane
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+
 services:
   redis:
     image: redis:7.4.5-bookworm@sha256:90e7a336d044f1abc9e9dbc05d65566850896d11453bbd1dd0fb7e5059f0e8fb
@@ -9,18 +20,113 @@ services:
       - control-plane
     volumes:
       - redis-data:/data
-      - ./config/redis.conf:/usr/local/etc/redis/redis.conf:ro
-      - ${OCS_REDIS_RUNTIME_DIR:-/tmp/mini-ocs-redis-runtime}:/run/mini-ocs
+      - ${OCS_REDIS_CONFIG_PATH:-./config/redis-compose.conf}:/usr/local/etc/redis/redis.conf:ro
+      - ${OCS_REDIS_RUNTIME_SOURCE:-redis-runtime}:/run/mini-ocs
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "--raw", "ping"]
       interval: 2s
       timeout: 1s
       retries: 15
       start_period: 2s
 
+  ocs-hwsim:
+    <<: *service-defaults
+    image: mini-ocs-hwsim:${OCS_IMAGE_TAG:-local}
+    build:
+      context: .
+      target: hwsim
+    command: ["/run/mini-ocs/ocs-hwsim.sock"]
+    volumes:
+      - hwsim-runtime:/run/mini-ocs
+    healthcheck:
+      test: ["CMD", "ocs-hwsimctl", "/run/mini-ocs/ocs-hwsim.sock", "health"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s
+
+  ocs-orch:
+    <<: *service-defaults
+    image: mini-ocs-orch:${OCS_IMAGE_TAG:-local}
+    build:
+      context: .
+      target: orch
+    command: ["tcp://redis:6379"]
+    environment:
+      OCS_REDIS_HOST: redis
+      OCS_REDIS_PORT: "6379"
+    depends_on:
+      redis:
+        condition: service_healthy
+        restart: true
+    healthcheck:
+      test: ["CMD", "ocs-healthcheck", "service", "ocs-orch"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 3s
+
+  ocs-syncd:
+    <<: *service-defaults
+    image: mini-ocs-syncd:${OCS_IMAGE_TAG:-local}
+    build:
+      context: .
+      target: syncd
+    command: ["tcp://redis:6379", "/run/mini-ocs/ocs-hwsim.sock"]
+    environment:
+      OCS_REDIS_HOST: redis
+      OCS_REDIS_PORT: "6379"
+    depends_on:
+      redis:
+        condition: service_healthy
+        restart: true
+      ocs-hwsim:
+        condition: service_healthy
+        restart: true
+    volumes:
+      - hwsim-runtime:/run/mini-ocs
+    healthcheck:
+      test: ["CMD", "ocs-healthcheck", "service", "ocs-syncd"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 3s
+
+  gnmi-server:
+    <<: *service-defaults
+    image: mini-ocs-gnmi:${OCS_IMAGE_TAG:-local}
+    build:
+      context: .
+      target: gnmi
+    command: ["--listen", "0.0.0.0:50051"]
+    environment:
+      OCS_REDIS_HOST: redis
+      OCS_REDIS_PORT: "6379"
+    depends_on:
+      ocs-orch:
+        condition: service_healthy
+        restart: true
+      ocs-syncd:
+        condition: service_healthy
+        restart: true
+    ports:
+      - "127.0.0.1:${OCS_GNMI_PORT:-50051}:50051"
+    networks:
+      - control-plane
+      - management
+    healthcheck:
+      test: ["CMD", "ocs-healthcheck", "gnmi", "--target", "127.0.0.1:50051"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 3s
+
 networks:
   control-plane:
     internal: true
+  management:
 
 volumes:
+  hwsim-runtime:
   redis-data:
+  redis-runtime:

@@ -2,6 +2,7 @@
 
 #include <sw/redis++/redis++.h>
 #include <algorithm>
+#include <charconv>
 #include <iterator>
 #include <stdexcept>
 #include <tuple>
@@ -78,6 +79,40 @@ void validateEvent(const EventEnvelope& event) {
 }
 
 }  // namespace
+
+RedisEndpoint parseRedisEndpoint(std::string_view target) {
+    constexpr std::string_view tcp_prefix = "tcp://";
+    constexpr std::string_view unix_prefix = "unix://";
+    if (target.starts_with(tcp_prefix)) {
+        const auto address = target.substr(tcp_prefix.size());
+        const auto separator = address.rfind(':');
+        if (separator == std::string_view::npos || separator == 0 ||
+            separator + 1 == address.size()) {
+            throw std::invalid_argument("Redis TCP endpoint must use tcp://HOST:PORT");
+        }
+        int port = 0;
+        const auto port_text = address.substr(separator + 1);
+        const auto [end, error] =
+            std::from_chars(port_text.data(), port_text.data() + port_text.size(), port);
+        if (error != std::errc{} || end != port_text.data() + port_text.size() ||
+            port < 1 || port > 65535) {
+            throw std::invalid_argument("Redis TCP endpoint port is outside 1..65535");
+        }
+        return {
+            .host = std::string(address.substr(0, separator)),
+            .port = port,
+            .unix_socket = "",
+        };
+    }
+    if (target.starts_with(unix_prefix)) {
+        target.remove_prefix(unix_prefix.size());
+    }
+    if (target.empty() || target.front() != '/') {
+        throw std::invalid_argument(
+            "Redis endpoint must be an absolute path, unix:///PATH, or tcp://HOST:PORT");
+    }
+    return {.unix_socket = std::string(target)};
+}
 
 class RedisRepository::Impl {
 public:

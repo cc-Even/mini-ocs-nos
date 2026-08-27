@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -19,6 +20,8 @@ struct RedisEndpoint {
     std::chrono::milliseconds connect_timeout{1000};
     std::chrono::milliseconds socket_timeout{1000};
 };
+
+[[nodiscard]] RedisEndpoint parseRedisEndpoint(std::string_view target);
 
 struct EventEnvelope {
     std::uint32_t event_schema_version{1};

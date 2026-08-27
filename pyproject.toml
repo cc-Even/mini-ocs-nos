@@ -18,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 gnmi-server = "gnmi_server.server:main"
+ocs-healthcheck = "gnmi_server.healthcheck:main"
 ocsctl = "ocsctl.main:app"
 
 [dependency-groups]
