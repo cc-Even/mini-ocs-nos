@@ -73,16 +73,16 @@ talks directly to standalone hwsim over UDS and only supports deterministic
 input/output port faults:
 
 ```bash
-ocs-hwsimctl /tmp/mini-ocs/ocs-hwsim.sock inject INPUT_PORT_DOWN 3
-ocs-hwsimctl /tmp/mini-ocs/ocs-hwsim.sock clear INPUT_PORT_DOWN 3
-ocs-hwsimctl /tmp/mini-ocs/ocs-hwsim.sock inject OUTPUT_PORT_DOWN 11
-ocs-hwsimctl /tmp/mini-ocs/ocs-hwsim.sock clear OUTPUT_PORT_DOWN 11
+build/dev/cpp/ocs-hwsimctl /tmp/mini-ocs/ocs-hwsim.sock inject INPUT_PORT_DOWN 3
+build/dev/cpp/ocs-hwsimctl /tmp/mini-ocs/ocs-hwsim.sock clear INPUT_PORT_DOWN 3
+build/dev/cpp/ocs-hwsimctl /tmp/mini-ocs/ocs-hwsim.sock inject OUTPUT_PORT_DOWN 11
+build/dev/cpp/ocs-hwsimctl /tmp/mini-ocs/ocs-hwsim.sock clear OUTPUT_PORT_DOWN 11
 ```
 
 Production management remains gNMI-only. The helper exists so reliability
 tests can alter simulator state without writing production-path Redis data.
 
-## Phase 3 acceptance
+## Management and reliability acceptance
 
 `make redis-integration-test` launches standalone hwsim, orch, syncd, and gNMI
 components and executes the CLI over a localhost gNMI endpoint. Scenario A
@@ -93,3 +93,7 @@ operational state, and counters remain unchanged.
 Scenario H injects an input-port fault through `ocs-hwsimctl`, verifies gNMI
 Subscribe reports DOWN and UP, observes the related connection and alarm, then
 waits for same-version full-snapshot recovery and zero active alarms.
+
+Next-apply timeout/error, out-of-band drift, process crash, and hwsim restart
+are driven by automated reliability fixtures rather than operator CLI commands.
+There is currently no public `ocsctl fault` command.

@@ -1,0 +1,106 @@
+# Testing
+
+The test strategy separates fast domain checks from formal Redis/UDS/process
+integration and a packaged gNMI-only E2E. Time-sensitive tests use bounded
+deadlines and polling rather than relying on one short fixed sleep.
+
+## Local commands
+
+| Command | Coverage | External requirements |
+|---|---|---|
+| `make test` | C++ unit/contracts, Python unit tests, Ruff | Compiler, CMake, Python; Redis tests skip |
+| `make redis-integration-test` | Redis contracts, orch/syncd, reliability C–H, real gNMI/CLI process tests | Docker daemon and Unix sockets |
+| `make sanitizer-test` | Non-Redis C++ suite with ASan/UBSan/leak detection | GCC or Clang |
+| `make sanitizer-integration-test` | Redis-dependent C++ suite with ASan/UBSan | Docker daemon |
+| `make image` | All pinned, non-root service image targets | Docker daemon |
+| `make up` | Complete dependency-gated runtime health | Docker daemon; localhost port 50051 |
+| `make e2e` | Fresh isolated Compose stack controlled only through gNMI | Docker daemon; localhost port 50052 by default |
+
+Run `make down` after manual Compose use. The integration and E2E harnesses have
+their own cleanup traps. The E2E project name and port can be overridden with
+`OCS_E2E_PROJECT_NAME` and `OCS_E2E_GNMI_PORT`.
+
+## Test layers
+
+### C++ unit and contract tests
+
+- atomic create/update/delete and matrix conflict behavior;
+- state-machine transitions, stable error codes, event schemas, and Redis keys;
+- UDS codec, malformed/oversize frames, request correlation, timeout,
+  disconnect, reconnect, generation change, stale path cleanup, and shutdown;
+- in-process and standalone simulator behavior, operation replay, faults, and
+  atomic old-matrix preservation;
+- orchestrator/syncd idempotency, version fences, recovery phases, retry,
+  reconciliation, ports, counters, alarms, and heartbeat independence.
+
+The default test run intentionally skips tests whose fixture requires a real
+Redis container. The integration command selects those tests explicitly.
+
+### Python unit tests
+
+- native path parsing and unsafe-input rejection;
+- JSON_IETF payload and complete-candidate validation;
+- update/replace/delete and atomic swap/conflict semantics;
+- Redis transaction retries and gRPC status mapping;
+- Get typing/filtering and missing-resource behavior;
+- Subscribe snapshot/sync/change/delete ordering and cancellation;
+- `ocsctl` deadlines, batch validation, ACTIVE waiting, malformed replies, and
+  absence of a Redis dependency.
+
+Real-Redis and Compose-marked pytest cases skip in the default run and execute
+under their dedicated harnesses.
+
+### Redis and process integration
+
+`make redis-integration-test` starts pinned Redis 7.4.5 with a random temporary
+Unix socket, builds the C++ programs, and runs the Redis-dependent C++ and Python
+suites. Formal device calls use `UdsDeviceBackend` and standalone hwsim. The
+suite covers transaction visibility, stream delivery/pending recovery,
+multi-phase crash points, exact result replay, concurrent consumers, gNMI
+management, CLI behavior, service restarts, diagnostics, and scenarios A–H.
+
+### Compose E2E
+
+`make e2e` creates an isolated full stack, waits for all health checks, and uses
+only the published gNMI endpoint. It creates three connections, waits for
+ACTIVE with matching versions/counters, then verifies that a conflicting
+two-member batch is atomically rejected and absent from both configuration and
+operational reads. Cleanup removes this test project's volumes.
+
+## Scenario matrix
+
+| Scenario | Expected result |
+|---|---|
+| A: normal config | 1→9, 2→10, 3→11 become ACTIVE; desired/applied versions match |
+| B: atomic conflict | Two connections sharing output 12 are rejected; neither is committed or applied |
+| C: timeout | Desired remains; actual does not falsely advance; retry state/counter/alarm appear |
+| D: recovery | Clearing failure converges to ACTIVE and clears alarm |
+| E: syncd crash | Pending command is claimed after restart with no duplicate effect |
+| F: hwsim restart | New generation refreshes actual state and restores current intent |
+| G: drift | Out-of-band simulator change is detected and full-snapshot reconciliation succeeds |
+| H: port DOWN | Port/connection/alarm/Subscribe changes are correct and recover after clear |
+
+## CI
+
+`.github/workflows/ci.yml` runs on pushes and pull requests with read-only
+repository permissions:
+
+1. Python dependency sync, lint, and pytest;
+2. C++ configure, build, and CTest;
+3. ASan/UBSan unit and Redis integration runs;
+4. real Redis and service-process integration;
+5. full Compose build, health, and E2E.
+
+Failed jobs upload relevant logs for 14 days. Compose cleanup runs even when a
+job fails.
+
+## Logs and reproducibility
+
+Integration output, Redis logs, CTest/pytest logs, and service logs are written
+below the ignored `artifacts/test-logs/` tree. CI uploads that tree on failure.
+Simulator identity and random seed are deterministic, dependencies and base
+images are pinned/locked, and each E2E harness cleans its isolated resources.
+
+For the latest exact test counts and commands, use the current iteration handoff
+in `docs/iteration-state.md` when working inside the development repository.
+That file is intentionally local/ignored and is not a stable public test report.
