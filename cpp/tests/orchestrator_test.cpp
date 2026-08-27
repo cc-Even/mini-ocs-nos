@@ -78,18 +78,7 @@ protected:
         runtime_directory_ = created;
         hwsim_socket_ = runtime_directory_ + "/hwsim.sock";
 
-        hwsim_pid_ = ::fork();
-        ASSERT_GE(hwsim_pid_, 0);
-        if (hwsim_pid_ == 0) {
-            ::execl(OCS_HWSIM_PATH, OCS_HWSIM_PATH, hwsim_socket_.c_str(), nullptr);
-            std::_Exit(127);
-        }
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (!std::filesystem::exists(hwsim_socket_) &&
-               std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-        ASSERT_TRUE(std::filesystem::exists(hwsim_socket_));
+        startHwsim();
 
         config_db_ = std::make_unique<ocs::redis::RedisRepository>(
             endpoint_, ocs::redis::LogicalDb::kConfig);
@@ -111,6 +100,35 @@ protected:
         alarm_db_->flushForTest();
 
         startServices();
+    }
+
+    void startHwsim() {
+        hwsim_pid_ = ::fork();
+        ASSERT_GE(hwsim_pid_, 0);
+        if (hwsim_pid_ == 0) {
+            ::execl(OCS_HWSIM_PATH, OCS_HWSIM_PATH, hwsim_socket_.c_str(), nullptr);
+            std::_Exit(127);
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!std::filesystem::exists(hwsim_socket_) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ASSERT_TRUE(std::filesystem::exists(hwsim_socket_));
+    }
+
+    void stopHwsim() {
+        ASSERT_GT(hwsim_pid_, 0);
+        ASSERT_EQ(::kill(hwsim_pid_, SIGTERM), 0);
+        int status = 0;
+        ASSERT_EQ(::waitpid(hwsim_pid_, &status, 0), hwsim_pid_);
+        hwsim_pid_ = -1;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::filesystem::exists(hwsim_socket_) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ASSERT_FALSE(std::filesystem::exists(hwsim_socket_));
     }
 
     void startServices() {
@@ -204,6 +222,118 @@ TEST_F(OrchestratorIntegrationTest, ConfigEventReachesActiveThroughStandaloneHws
         device_db_->pendingCount(std::string(ocs::redis::kDeviceCommands), "ocs-syncd"), 0);
     EXPECT_EQ(
         device_db_->pendingCount(std::string(ocs::redis::kDeviceResults), "ocs-orch"), 0);
+}
+
+TEST_F(OrchestratorIntegrationTest, RecoversConfirmedStateAfterStandaloneHwsimRestart) {
+    const ocs::redis::EventEnvelope create{
+        .event_schema_version = 1,
+        .event_id = "event-hwsim-restart-001",
+        .request_id = "request-hwsim-restart-001",
+        .timestamp_ns = 1780000000000000060ULL,
+        .device = "ocs0",
+        .resource_type = "connection",
+        .resource_id = "conn-hwsim-restart",
+        .operation = "UPSERT",
+        .desired_version = 1,
+        .payload = R"({"input_port":3,"output_port":11})",
+    };
+    applyConfigEvent(create);
+    const auto first_device_state =
+        state_db_->getHash(ocs::redis::deviceStateKey("ocs0"));
+    const auto first_generation = std::stoull(first_device_state.at("device_generation"));
+
+    stopHwsim();
+    EXPECT_FALSE(syncd_->pollDevice());
+    const auto unavailable = state_db_->getHash(ocs::redis::deviceStateKey("ocs0"));
+    EXPECT_EQ(unavailable.at("oper_status"), "FAILED");
+    EXPECT_EQ(unavailable.at("last_error_code"), "OCS_DEVICE_NOT_READY");
+
+    const ocs::redis::EventEnvelope update{
+        .event_schema_version = 1,
+        .event_id = "event-hwsim-restart-002",
+        .request_id = "request-hwsim-restart-002",
+        .timestamp_ns = 1780000000000000061ULL,
+        .device = "ocs0",
+        .resource_type = "connection",
+        .resource_id = "conn-hwsim-restart",
+        .operation = "UPSERT",
+        .desired_version = 2,
+        .payload = R"({"input_port":4,"output_port":12})",
+    };
+    static_cast<void>(config_db_->appendEvent(
+        std::string(ocs::redis::kConfigEvents), update));
+    ASSERT_TRUE(orch_->processConfigOne("orch-hwsim-down"));
+    ASSERT_TRUE(syncd_->processOne("syncd-hwsim-down"));
+    ASSERT_TRUE(orch_->processResultOne("orch-hwsim-down-result"));
+    const auto failed =
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "conn-hwsim-restart"));
+    EXPECT_EQ(failed.at("apply_status"), "FAILED");
+    EXPECT_EQ(failed.at("last_error_code"), "OCS_DEVICE_NOT_READY");
+    const auto unconfirmed =
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "conn-hwsim-restart"));
+    EXPECT_EQ(unconfirmed.at("apply_status"), "FAILED");
+    EXPECT_EQ(unconfirmed.at("applied_version"), "1");
+    EXPECT_EQ(unconfirmed.at("actual_present"), "true");
+
+    startHwsim();
+    ASSERT_TRUE(syncd_->pollDevice());
+    const auto restarted = state_db_->getHash(ocs::redis::deviceStateKey("ocs0"));
+    const auto restarted_generation = std::stoull(restarted.at("device_generation"));
+    EXPECT_NE(restarted_generation, first_generation);
+    EXPECT_EQ(restarted.at("oper_status"), "READY");
+    EXPECT_EQ(restarted.at("actual_connection_count"), "0");
+    const auto refreshed =
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "conn-hwsim-restart"));
+    EXPECT_EQ(refreshed.at("actual_present"), "false");
+    EXPECT_EQ(refreshed.at("applied_version"), "0");
+    EXPECT_EQ(
+        counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"))
+            .at("active_connections"),
+        "0");
+
+    const auto recovery = device_db_->getHash(
+        ocs::redis::syncdGenerationRecoveryKey("ocs0", restarted_generation));
+    ASSERT_EQ(recovery.at("recovery_required"), "true");
+    ASSERT_TRUE(syncd_->pollDevice());
+    EXPECT_EQ(
+        device_db_->pendingCount(std::string(ocs::redis::kDeviceCommands), "ocs-syncd"),
+        0);
+    ASSERT_TRUE(syncd_->processOne("syncd-hwsim-recovery"));
+    EXPECT_FALSE(syncd_->processOne("syncd-hwsim-recovery-duplicate"));
+    ASSERT_TRUE(orch_->processResultOne("orch-hwsim-recovery-result"));
+    ASSERT_TRUE(syncd_->pollDevice());
+
+    const auto active =
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "conn-hwsim-restart"));
+    EXPECT_EQ(active.at("apply_status"), "ACTIVE");
+    const auto confirmed =
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "conn-hwsim-restart"));
+    EXPECT_EQ(confirmed.at("apply_status"), "ACTIVE");
+    EXPECT_EQ(confirmed.at("input_port"), "4");
+    EXPECT_EQ(confirmed.at("output_port"), "12");
+    EXPECT_EQ(confirmed.at("desired_version"), "2");
+    EXPECT_EQ(confirmed.at("applied_version"), "2");
+    EXPECT_EQ(confirmed.at("actual_present"), "true");
+    EXPECT_EQ(
+        counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"))
+            .at("active_connections"),
+        "1");
+    EXPECT_EQ(
+        state_db_->getHash(ocs::redis::deviceStateKey("ocs0"))
+            .at("actual_connection_count"),
+        "1");
+    const auto version = device_db_->getHash(
+        ocs::redis::syncdConnectionVersionKey("ocs0", "conn-hwsim-restart"));
+    EXPECT_EQ(version.at("device_generation"), std::to_string(restarted_generation));
+
+    syncd_.reset();
+    ocs::UdsDeviceBackend verifier(hwsim_socket_);
+    const auto actual = verifier.getConnections();
+    ASSERT_EQ(actual.size(), 1);
+    EXPECT_EQ(actual.front().id, "conn-hwsim-restart");
+    EXPECT_EQ(actual.front().input_port, 4);
+    EXPECT_EQ(actual.front().output_port, 12);
+    EXPECT_EQ(actual.front().applied_version, 2);
 }
 
 TEST_F(OrchestratorIntegrationTest, ApplyTimeoutRaisesAlarmAndRecoversAfterDurableRetry) {

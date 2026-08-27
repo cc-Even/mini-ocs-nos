@@ -63,6 +63,23 @@ TEST_F(RedisContractTest, ReplacesHashWithoutRetainingOldFields) {
     EXPECT_EQ(config_->getHash(key), replacement);
 }
 
+TEST_F(RedisContractTest, ScansMatchingKeysWithinExplicitResultBound) {
+    const auto first = ocs::redis::connectionConfigKey("ocs0", "scan-a");
+    const auto second = ocs::redis::connectionConfigKey("ocs0", "scan-b");
+    config_->putHash(first, {{"desired_version", "1"}});
+    config_->putHash(second, {{"desired_version", "1"}});
+    config_->putHash(
+        ocs::redis::connectionConfigKey("ocs1", "scan-other"),
+        {{"desired_version", "1"}});
+
+    EXPECT_EQ(
+        config_->scanKeys("OCS_CONNECTION|ocs0|*", 2),
+        (std::vector<std::string>{first, second}));
+    EXPECT_THROW(
+        static_cast<void>(config_->scanKeys("OCS_CONNECTION|ocs0|*", 1)),
+        std::runtime_error);
+}
+
 TEST_F(RedisContractTest, VersionedOncePublicationCannotOverwriteNewerHash) {
     const auto key = ocs::redis::connectionConfigKey("ocs0", "conn-version-fence");
     const auto marker = "OCS_TEST_VERSIONED_MARKER";

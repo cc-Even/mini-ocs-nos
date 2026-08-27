@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -57,6 +58,32 @@ inline constexpr std::string_view kFaultCommands = "OCS_FAULT_COMMANDS";
     std::string_view connection_id) {
     return "OCS_SYNCD_CONNECTION_VERSION|" + std::string(device) + "|" +
            std::string(connection_id);
+}
+
+[[nodiscard]] inline std::string connectionDevicePattern(std::string_view device) {
+    return "OCS_CONNECTION_DEVICE|" + std::string(device) + "|*";
+}
+
+[[nodiscard]] inline std::string syncdGenerationRecoveryKey(
+    std::string_view device,
+    std::uint64_t generation) {
+    return "OCS_SYNCD_GENERATION_RECOVERY|" + std::string(device) + "|" +
+           std::to_string(generation);
+}
+
+[[nodiscard]] inline std::string syncdGenerationStatePublicationKey(
+    std::string_view device,
+    std::uint64_t generation,
+    std::string_view connection_id) {
+    return "OCS_SYNCD_GENERATION_STATE_PUBLISHED|" + std::string(device) + "|" +
+           std::to_string(generation) + "|" + std::string(connection_id);
+}
+
+[[nodiscard]] inline std::string syncdGenerationCountersPublicationKey(
+    std::string_view device,
+    std::uint64_t generation) {
+    return "OCS_SYNCD_GENERATION_COUNTERS_PUBLISHED|" + std::string(device) + "|" +
+           std::to_string(generation);
 }
 
 [[nodiscard]] inline std::string processedDeviceCommandKey(std::string_view command_id) {

@@ -194,6 +194,29 @@ an envelope-level fallback result, which orch acknowledges as an orphan if no
 application resource exists. Therefore recovery can resume after any persistence
 boundary without losing or duplicating those effects.
 
+syncd polls the standalone device with `GET_DEVICE_INFO` and `GET_CONNECTIONS`
+every 250 milliseconds by default; `OCS_SYNCD_DEVICE_POLL_MS` configures a
+bounded 10 millisecond to one hour interval. A disconnect changes
+`OCS_DEVICE_STATE|device` to `FAILED` but does not erase the last connection
+snapshot because the hardware result is not yet confirmed. Read-only UDS
+requests may reconnect and retry once; mutation requests are never retried
+after an unconfirmed response and therefore cannot manufacture success.
+
+Every successful handshake records `device_generation` and the confirmed
+`actual_connection_count` in the device state. When the generation changes,
+syncd first reads the new actual matrix, atomically refreshes each known
+connection's `actual_present` and `applied_version`, and adjusts the active
+counter through generation-specific once markers. It then scans at most 4096
+current `OCS_CONNECTION_DEVICE|device|*` snapshots and publishes one atomic
+`GENERATION_RECOVERY` command if the new matrix differs. The Redis scan is
+bounded by both results and pages. `OCS_SYNCD_GENERATION_RECOVERY|device|gen`
+fences command publication, while per-connection state and counter markers
+make a crash during refresh resumable. Successful resource-version records
+also carry the device generation, so a version accepted by an old simulator
+cannot suppress necessary work on its replacement. Recovery results may move
+same-version failed application state through the existing retry transition
+path back to `ACTIVE` (or `ABSENT` for a remove).
+
 Each syncd loop first performs a bounded XPENDING scan and XCLAIM for commands
 whose idle time exceeds `OCS_SYNCD_PENDING_MIN_IDLE_MS` (five seconds by
 default), then reads a new command. The claim threshold is configurable for

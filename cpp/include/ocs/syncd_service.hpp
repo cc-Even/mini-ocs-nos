@@ -7,6 +7,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -20,6 +21,7 @@ public:
         std::chrono::milliseconds pending_min_idle = std::chrono::seconds(5));
 
     void initialize();
+    [[nodiscard]] bool pollDevice();
     [[nodiscard]] bool processOne(
         const std::string& consumer_name,
         const std::function<void()>& before_ack = {},
@@ -43,6 +45,14 @@ private:
         const redis::EventEnvelope& command_event,
         const DeviceCommandBatch& batch,
         const ApplyResult& result);
+    void publishDeviceState(
+        const DeviceInfo& info,
+        std::size_t actual_connection_count,
+        std::string_view status,
+        const Error& error);
+    void scheduleGenerationRecovery(
+        const DeviceInfo& info,
+        const std::vector<AppliedConnection>& actual);
 
     redis::RedisRepository device_db_;
     redis::RedisRepository state_db_;
@@ -50,6 +60,8 @@ private:
     redis::RedisRepository config_db_;
     std::unique_ptr<OcsDeviceApi> device_;
     std::chrono::milliseconds pending_min_idle_;
+    std::string device_name_;
+    std::uint64_t device_generation_{};
 };
 
 }  // namespace ocs

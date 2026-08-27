@@ -1,10 +1,12 @@
 #include "ocs/redis_repository.hpp"
 
 #include <sw/redis++/redis++.h>
+#include <algorithm>
 #include <iterator>
 #include <stdexcept>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace ocs::redis {
@@ -147,6 +149,36 @@ bool RedisRepository::putHashIfAbsent(
 std::map<std::string, std::string> RedisRepository::getHash(const std::string& key) {
     std::map<std::string, std::string> result;
     impl_->redis.hgetall(key, std::inserter(result, result.end()));
+    return result;
+}
+
+std::vector<std::string> RedisRepository::scanKeys(
+    const std::string& pattern,
+    std::size_t max_results) {
+    if (pattern.empty() || max_results == 0) {
+        throw std::invalid_argument("Redis key scan requires a pattern and positive bound");
+    }
+    sw::redis::Cursor cursor = 0;
+    std::vector<std::string> result;
+    std::unordered_set<std::string> seen;
+    std::size_t page_count = 0;
+    do {
+        if (++page_count > 4096) {
+            throw std::runtime_error("Redis key scan exceeded page bound");
+        }
+        std::vector<std::string> page;
+        cursor = impl_->redis.scan(cursor, pattern, 128, std::back_inserter(page));
+        for (auto& key : page) {
+            if (!seen.insert(key).second) {
+                continue;
+            }
+            if (result.size() == max_results) {
+                throw std::runtime_error("Redis key scan exceeded result bound");
+            }
+            result.push_back(std::move(key));
+        }
+    } while (cursor != 0);
+    std::ranges::sort(result);
     return result;
 }
 

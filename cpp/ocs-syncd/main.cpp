@@ -34,6 +34,18 @@ std::chrono::milliseconds pendingMinIdle() {
     return std::chrono::milliseconds(value);
 }
 
+std::chrono::milliseconds devicePollInterval() {
+    const char* configured = std::getenv("OCS_SYNCD_DEVICE_POLL_MS");
+    if (configured == nullptr) {
+        return std::chrono::milliseconds(250);
+    }
+    const auto value = std::stoll(configured);
+    if (value < 10 || value > 3'600'000) {
+        throw std::invalid_argument("OCS_SYNCD_DEVICE_POLL_MS is outside 10..3600000");
+    }
+    return std::chrono::milliseconds(value);
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -51,8 +63,15 @@ int main(int argc, char* argv[]) {
         ocs::SyncdService service(
             std::move(endpoint), std::move(backend), pendingMinIdle());
         service.initialize();
+        const auto poll_interval = devicePollInterval();
+        auto next_poll = std::chrono::steady_clock::now() + poll_interval;
         bool crash_before_ack = std::getenv("OCS_SYNCD_CRASH_BEFORE_ACK_ONCE") != nullptr;
         while (running.load()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= next_poll) {
+                static_cast<void>(service.pollDevice());
+                next_poll = now + poll_interval;
+            }
             const auto before_ack = [&crash_before_ack] {
                 if (crash_before_ack) {
                     crash_before_ack = false;

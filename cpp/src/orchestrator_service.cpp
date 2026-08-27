@@ -200,6 +200,10 @@ std::string resultCommandId(
     return event.event_id.substr(0, suffix);
 }
 
+bool isGenerationRecovery(std::string_view command_id) {
+    return command_id.starts_with("hwsim-recovery:");
+}
+
 std::uint64_t retryAtNs(
     std::uint64_t now_ns,
     std::size_t retry_attempt,
@@ -485,11 +489,19 @@ bool OrchestratorService::processResultOne(
     }
 
     const auto application_version = currentVersion(application);
+    const auto current = currentStatus(application);
+    const bool generation_recovery =
+        isGenerationRecovery(result.value("command_id", std::string{})) ||
+        isGenerationRecovery(message.event.event_id);
+    const bool recovering_failed_application =
+        generation_recovery && success &&
+        (current == ConnectionApplyStatus::kFailed ||
+         current == ConnectionApplyStatus::kRetryWait);
     if (message.event.desired_version <= application_version &&
         (message.event.desired_version < application_version ||
-         currentStatus(application) == ConnectionApplyStatus::kActive ||
-         currentStatus(application) == ConnectionApplyStatus::kAbsent ||
-         currentStatus(application) == ConnectionApplyStatus::kFailed)) {
+         current == ConnectionApplyStatus::kActive ||
+         current == ConnectionApplyStatus::kAbsent ||
+         (current == ConnectionApplyStatus::kFailed && !recovering_failed_application))) {
         const auto acknowledged = device_db_.acknowledge(
             std::string(redis::kDeviceResults), std::string(kConsumerGroup), message.id);
         static_cast<void>(acknowledged);
@@ -499,13 +511,26 @@ bool OrchestratorService::processResultOne(
         throw std::runtime_error("device result is newer than application state");
     }
 
-    const auto current = currentStatus(application);
     ConnectionApplyStatus next = ConnectionApplyStatus::kFailed;
     if (success) {
-        next = current == ConnectionApplyStatus::kRemoving ? ConnectionApplyStatus::kAbsent
-                                                           : ConnectionApplyStatus::kActive;
+        const auto operation = application.find("operation");
+        const bool removing = current == ConnectionApplyStatus::kRemoving ||
+                              (generation_recovery &&
+                               operation != application.end() && operation->second == "REMOVE");
+        next = removing ? ConnectionApplyStatus::kAbsent : ConnectionApplyStatus::kActive;
     }
-    requireTransition(current, next);
+    if (recovering_failed_application) {
+        if (current == ConnectionApplyStatus::kFailed) {
+            requireTransition(current, ConnectionApplyStatus::kRetryWait);
+        }
+        const auto executing = next == ConnectionApplyStatus::kAbsent
+                                   ? ConnectionApplyStatus::kRemoving
+                                   : ConnectionApplyStatus::kApplying;
+        requireTransition(ConnectionApplyStatus::kRetryWait, executing);
+        requireTransition(executing, next);
+    } else {
+        requireTransition(current, next);
+    }
 
     application["apply_status"] = std::string(toString(next));
     application["last_error_code"] =

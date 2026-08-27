@@ -39,6 +39,7 @@ from gnmi_server.redis_repository import RedisSettings, create_redis_client
 _INTEGER_FIELDS: Final = {
     "active_alarms",
     "active_connections",
+    "actual_connection_count",
     "applied_version",
     "created_at_ns",
     "desired_version",

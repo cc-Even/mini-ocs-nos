@@ -56,6 +56,9 @@ public:
         const std::string& key,
         const std::map<std::string, std::string>& fields);
     [[nodiscard]] std::map<std::string, std::string> getHash(const std::string& key);
+    [[nodiscard]] std::vector<std::string> scanKeys(
+        const std::string& pattern,
+        std::size_t max_results = 4096);
     [[nodiscard]] long long incrementHashField(
         const std::string& key,
         const std::string& field,
