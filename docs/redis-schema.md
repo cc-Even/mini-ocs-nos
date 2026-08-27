@@ -209,8 +209,14 @@ every 250 milliseconds by default; `OCS_SYNCD_DEVICE_POLL_MS` configures a
 bounded 10 millisecond to one hour interval. A disconnect changes
 `OCS_DEVICE_STATE|device` to `FAILED` but does not erase the last connection
 snapshot because the hardware result is not yet confirmed. Read-only UDS
-requests may reconnect and retry once; mutation requests are never retried
-after an unconfirmed response and therefore cannot manufacture success.
+requests may reconnect and retry once; mutation requests are never blindly
+retried after an unconfirmed response. syncd instead reconnects with bounded
+read-only queries and promotes the result to success only when every requested
+UPSERT or REMOVE and every referenced port are confirmed. If that immediate
+query also fails, a later successful poll detects terminal Redis state that
+disagrees with already-converged hardware truth and publishes one idempotent
+confirmation recovery. This closes CREATE, UPDATE, and DELETE reply-loss gaps
+without manufacturing success from Redis acceptance alone.
 
 Every successful handshake records `device_generation` and the confirmed
 `actual_connection_count` in the device state. When the generation changes,
@@ -260,6 +266,9 @@ CLEARED, RECOVERY_PUBLISHED, and RECOVERED fault cycle. A DOWN transition raises
 `port-down-direction-id`, increments `port_down_total` once, and accounts for
 the alarm once across ALARM_DB and COUNTERS_DB. Applying the full snapshot while
 the fault remains active fails with `OCS_PORT_DOWN` without changing hardware.
+Members already confirmed ACTIVE on healthy ports keep their state and receive
+successful per-member results; only affected or otherwise unconfirmed members
+become FAILED even though the device apply is atomic.
 After the port returns UP, a failed same-version connection is reapplied once;
 successful device confirmation restores ACTIVE and clears both the port and
 drift alarms. Standalone hwsim accepts concurrent syncd and simulator-only
@@ -364,12 +373,15 @@ connection counts, drift, active alarms, the pending count for each reliable
 consumer group, and the complete device counter hash.
 
 `ocs-orch` and `ocs-syncd` refresh `OCS_SERVICE_STATE|service` in STATE_DB with
-`status=ONLINE` and `last_seen_ns`. syncd records standalone hwsim as ONLINE
-after successful polling and OFFLINE after a failed poll. A diagnostics request
-is itself proof that the gNMI service is online; the other service heartbeats
-must be no older than two seconds. Missing, malformed, stale, or explicitly
-offline heartbeats make `core-services-online` false. Missing streams or groups
-have zero pending work, while other Redis errors retain the request's bounded
+`status=ONLINE` and `last_seen_ns`. syncd owns a dedicated heartbeat thread and
+Redis connection, so blocked device RPCs and full polling cannot make the live
+process appear stale. Independently of the configurable full device-poll
+cadence, its main loop also schedules a bounded identity probe and records
+standalone hwsim as ONLINE or OFFLINE from that result. A diagnostics request is
+itself proof that the gNMI service is online; the other service heartbeats must
+be no older than two seconds. Missing, malformed, stale, or explicitly offline
+heartbeats make `core-services-online` false. Missing streams or groups have
+zero pending work, while other Redis errors retain the request's bounded
 deadline and normal gNMI error mapping.
 
 ## gNMI ON_CHANGE subscriptions

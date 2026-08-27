@@ -24,6 +24,7 @@ public:
         std::chrono::milliseconds pending_min_idle = std::chrono::seconds(5));
 
     void initialize();
+    [[nodiscard]] bool pollDeviceLiveness();
     [[nodiscard]] bool pollDevice();
     [[nodiscard]] bool processOne(
         const std::string& consumer_name,
@@ -93,7 +94,10 @@ private:
         const DeviceInfo& info,
         const PortState& port,
         std::string_view activation_id);
-    void publishServiceHeartbeat(bool hwsim_online);
+    void publishHwsimHeartbeat(bool online);
+    [[nodiscard]] ApplyResult confirmAppliedResult(
+        const DeviceCommandBatch& batch,
+        ApplyResult result);
     [[nodiscard]] std::vector<std::pair<std::string, std::map<std::string, std::string>>>
     portFaults(std::string_view device);
     void associatePortFaults(

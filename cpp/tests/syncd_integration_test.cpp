@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -158,6 +159,78 @@ TEST_F(SyncdIntegrationTest, AppliesCommandPublishesStateAndResultThenAcknowledg
     EXPECT_EQ(results.front().event.request_id, "request-001");
     EXPECT_EQ(results.front().event.operation, "APPLY_RESULT");
     EXPECT_EQ(device_db_->pendingCount(std::string(ocs::redis::kDeviceCommands), "ocs-syncd"), 0);
+}
+
+TEST_F(SyncdIntegrationTest, ConfirmsCreateUpdateAndDeleteAfterApplyReplyIsLost) {
+    const std::string result_group = "lost-reply-results";
+    device_db_->createConsumerGroup(std::string(ocs::redis::kDeviceResults), result_group);
+    const auto apply_with_lost_reply = [this](
+                                           std::string command_id,
+                                           ocs::ConnectionOperation operation,
+                                           ocs::PortId input_port,
+                                           ocs::PortId output_port,
+                                           std::uint64_t desired_version) {
+        const ocs::DeviceCommandBatch batch{
+            .commands = {{
+                .operation = operation,
+                .id = "lost-reply",
+                .input_port = input_port,
+                .output_port = output_port,
+                .desired_version = desired_version,
+            }},
+            .options = {},
+        };
+        const ocs::redis::EventEnvelope event{
+            .event_schema_version = 1,
+            .event_id = std::move(command_id),
+            .request_id = "request-lost-reply-" + std::to_string(desired_version),
+            .timestamp_ns = 1780000000000000040ULL + desired_version,
+            .device = "ocs0",
+            .resource_type = "connection",
+            .resource_id = "lost-reply",
+            .operation = operation == ocs::ConnectionOperation::kRemove ? "REMOVE" : "UPSERT",
+            .desired_version = desired_version,
+            .payload = ocs::encodeDeviceCommand(batch),
+        };
+        static_cast<void>(device_db_->appendEvent(
+            std::string(ocs::redis::kDeviceCommands), event));
+        hwsim_->dropNextApplyReplyForTest();
+        ASSERT_TRUE(syncd_->processOne("lost-reply-consumer"));
+    };
+
+    apply_with_lost_reply(
+        "lost-reply-create", ocs::ConnectionOperation::kUpsert, 1, 9, 1);
+    auto state = state_db_->getHash(
+        ocs::redis::connectionStateKey("ocs0", "lost-reply"));
+    EXPECT_EQ(state.at("apply_status"), "ACTIVE");
+    EXPECT_EQ(state.at("input_port"), "1");
+    EXPECT_EQ(state.at("applied_version"), "1");
+
+    apply_with_lost_reply(
+        "lost-reply-update", ocs::ConnectionOperation::kUpsert, 2, 10, 2);
+    state = state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "lost-reply"));
+    EXPECT_EQ(state.at("apply_status"), "ACTIVE");
+    EXPECT_EQ(state.at("input_port"), "2");
+    EXPECT_EQ(state.at("output_port"), "10");
+    EXPECT_EQ(state.at("applied_version"), "2");
+
+    apply_with_lost_reply(
+        "lost-reply-delete", ocs::ConnectionOperation::kRemove, 0, 0, 3);
+    EXPECT_TRUE(
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "lost-reply")).empty());
+    EXPECT_TRUE(simulated_device_->getConnections().empty());
+
+    const auto counters = counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"));
+    EXPECT_EQ(counters.at("device_apply_total"), "3");
+    EXPECT_EQ(counters.at("device_apply_success_total"), "3");
+    EXPECT_EQ(counters.at("device_apply_failure_total"), "0");
+    EXPECT_EQ(counters.at("active_connections"), "0");
+    const auto results = device_db_->readGroup(
+        std::string(ocs::redis::kDeviceResults), result_group, "lost-reply-result-reader", 10);
+    ASSERT_EQ(results.size(), 3);
+    EXPECT_TRUE(std::ranges::all_of(results, [](const auto& message) {
+        return message.event.payload.find("\"success\":true") != std::string::npos;
+    }));
 }
 
 TEST_F(SyncdIntegrationTest, FailedUpdatePreservesLastConfirmedActualConnection) {

@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import sys
+import time
 from pathlib import Path
 
 import grpc
 import pytest
 from gnmi_server.get_repository import RedisGetRepository
 from gnmi_server.get_transaction import GetTransaction
-from gnmi_server.redis_keys import device_config_key
+from gnmi_server.redis_keys import CONFIG_DB, STATE_DB, device_config_key, service_state_key
 from gnmi_server.redis_repository import RedisConfigRepository, RedisSettings, create_redis_client
 from gnmi_server.server import create_server
 from gnmi_server.service import GnmiService
@@ -68,6 +70,74 @@ async def _run_cli(target: str, *arguments: str) -> tuple[int, str, str]:
     )
     stdout, stderr = await process.communicate()
     return process.returncode, stdout.decode(), stderr.decode()
+
+
+async def test_blocked_device_poll_keeps_syncd_process_heartbeat_fresh(
+    tmp_path: Path,
+) -> None:
+    redis_socket = os.environ["OCS_REDIS_SOCKET"]
+    settings = RedisSettings(unix_socket=redis_socket)
+    config = create_redis_client(settings, CONFIG_DB)
+    state = create_redis_client(settings, STATE_DB)
+    await asyncio.gather(config.flushdb(), state.flushdb())
+    hwsim_socket = tmp_path / "blocked-poll-hwsim.sock"
+    executable_root = REPOSITORY_ROOT / "build" / "dev" / "cpp"
+    processes: list[asyncio.subprocess.Process] = []
+    logs: list[str] = []
+    hwsim_suspended = False
+    try:
+        hwsim = await asyncio.create_subprocess_exec(
+            executable_root / "ocs-hwsim",
+            hwsim_socket,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        processes.append(hwsim)
+        await _wait_for_path(hwsim_socket)
+        environment = os.environ.copy()
+        environment["OCS_SYNCD_DEVICE_POLL_MS"] = "10"
+        processes.append(
+            await asyncio.create_subprocess_exec(
+                executable_root / "ocs-syncd",
+                redis_socket,
+                hwsim_socket,
+                env=environment,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        )
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while True:
+            hwsim_heartbeat = await state.hgetall(service_state_key("ocs-hwsim"))
+            if hwsim_heartbeat.get("status") == "ONLINE":
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("blocked-poll syncd did not initialize")
+            await asyncio.sleep(0.02)
+
+        hwsim.send_signal(signal.SIGSTOP)
+        hwsim_suspended = True
+        deadline = asyncio.get_running_loop().time() + 4.0
+        while True:
+            hwsim_heartbeat = await state.hgetall(service_state_key("ocs-hwsim"))
+            if hwsim_heartbeat.get("status") == "OFFLINE":
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("syncd did not observe the blocked hwsim")
+            await asyncio.sleep(0.02)
+
+        now_ns = time.time_ns()
+        heartbeat = await state.hgetall(service_state_key("ocs-syncd"))
+        assert heartbeat["status"] == "ONLINE"
+        assert 0 <= now_ns - int(heartbeat["last_seen_ns"]) < 1_000_000_000
+    finally:
+        if hwsim_suspended:
+            hwsim.send_signal(signal.SIGCONT)
+        for process in reversed(processes):
+            logs.append(await _stop_process(process))
+        await asyncio.gather(config.aclose(), state.aclose())
+        if any(process.returncode not in {0, -15} for process in processes):
+            pytest.fail("blocked-poll service failed:\n" + "\n".join(logs))
 
 
 async def test_scenarios_a_b_and_h_through_ocsctl_and_gnmi(tmp_path: Path) -> None:
@@ -182,6 +252,12 @@ async def test_scenarios_a_b_and_h_through_ocsctl_and_gnmi(tmp_path: Path) -> No
                 "ocs0", "conn-3", apply_status="FAILED"
             )
             assert failed["last-error-code"] == "OCS_PORT_DOWN"
+            unaffected = [
+                await client.get(connection_path("ocs0", connection_id, "state"))
+                for connection_id in ("conn-1", "conn-2")
+            ]
+            assert all(state["apply-status"] == "ACTIVE" for state in unaffected)
+            assert all(state["actual-present"] is True for state in unaffected)
             alarm = await client.get(alarm_path)
             assert alarm["active"] is True
             assert alarm["affected-connection-count"] == 1

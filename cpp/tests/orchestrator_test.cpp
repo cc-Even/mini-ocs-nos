@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -223,6 +224,135 @@ TEST_F(OrchestratorIntegrationTest, ConfigEventReachesActiveThroughStandaloneHws
         device_db_->pendingCount(std::string(ocs::redis::kDeviceCommands), "ocs-syncd"), 0);
     EXPECT_EQ(
         device_db_->pendingCount(std::string(ocs::redis::kDeviceResults), "ocs-orch"), 0);
+}
+
+TEST_F(OrchestratorIntegrationTest, RecoversFailedRedisStateFromConfirmedHardwareTruth) {
+    const auto config_key = ocs::redis::connectionConfigKey("ocs0", "confirmed-truth");
+    config_db_->putHash(
+        config_key,
+        {
+            {"device", "ocs0"},
+            {"id", "confirmed-truth"},
+            {"input_port", "4"},
+            {"output_port", "12"},
+            {"desired_version", "1"},
+        });
+    ocs::UdsDeviceBackend direct(hwsim_socket_);
+    ASSERT_TRUE(
+        direct
+            .applyConnections(
+                {{
+                    .id = "confirmed-truth",
+                    .input_port = 4,
+                    .output_port = 12,
+                    .desired_version = 1,
+                }},
+                {.operation_id = "external-confirmed-create"})
+            .ok());
+    std::map<std::string, std::string> failed_application{
+        {"device", "ocs0"},
+        {"id", "confirmed-truth"},
+        {"input_port", "4"},
+        {"output_port", "12"},
+        {"desired_version", "1"},
+        {"apply_status", "FAILED"},
+        {"operation", "UPSERT"},
+        {"request_id", "lost-create-request"},
+        {"event_id", "lost-create-event"},
+        {"command_id", "lost-create-command"},
+        {"retry_attempt", "0"},
+        {"next_retry_at_ns", ""},
+        {"failed_command_id", "lost-create-command"},
+        {"last_error_code", "OCS_DEVICE_NOT_READY"},
+        {"last_error_message", "apply reply was not confirmed"},
+    };
+    appl_db_->putHash(
+        ocs::redis::connectionAppKey("ocs0", "confirmed-truth"), failed_application);
+    device_db_->putHash(
+        ocs::redis::connectionDeviceKey("ocs0", "confirmed-truth"), failed_application);
+    state_db_->putHash(
+        ocs::redis::connectionStateKey("ocs0", "confirmed-truth"),
+        {
+            {"device", "ocs0"},
+            {"id", "confirmed-truth"},
+            {"input_port", "4"},
+            {"output_port", "12"},
+            {"desired_version", "1"},
+            {"applied_version", "0"},
+            {"actual_present", "false"},
+            {"apply_status", "FAILED"},
+            {"last_error_code", "OCS_DEVICE_NOT_READY"},
+            {"last_error_message", "apply reply was not confirmed"},
+        });
+
+    ASSERT_TRUE(syncd_->pollDevice());
+    ASSERT_TRUE(syncd_->processOne("confirmed-create-recovery"));
+    ASSERT_TRUE(orch_->processResultOne("confirmed-create-result"));
+    ASSERT_TRUE(syncd_->pollDevice());
+    EXPECT_EQ(
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "confirmed-truth"))
+            .at("apply_status"),
+        "ACTIVE");
+    EXPECT_EQ(
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "confirmed-truth"))
+            .at("actual_present"),
+        "true");
+    EXPECT_EQ(
+        counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"))
+            .at("active_connections"),
+        "1");
+
+    ASSERT_TRUE(config_db_->deleteKey(config_key));
+    ASSERT_TRUE(
+        direct
+            .applyConnections(
+                {{
+                    .operation = ocs::ConnectionOperation::kRemove,
+                    .id = "confirmed-truth",
+                    .desired_version = 2,
+                }},
+                {.operation_id = "external-confirmed-delete"})
+            .ok());
+    failed_application["desired_version"] = "2";
+    failed_application["apply_status"] = "FAILED";
+    failed_application["operation"] = "REMOVE";
+    failed_application["command_id"] = "lost-delete-command";
+    failed_application["failed_command_id"] = "lost-delete-command";
+    appl_db_->putHash(
+        ocs::redis::connectionAppKey("ocs0", "confirmed-truth"), failed_application);
+    device_db_->putHash(
+        ocs::redis::connectionDeviceKey("ocs0", "confirmed-truth"), failed_application);
+    state_db_->putHash(
+        ocs::redis::connectionStateKey("ocs0", "confirmed-truth"),
+        {
+            {"device", "ocs0"},
+            {"id", "confirmed-truth"},
+            {"input_port", "4"},
+            {"output_port", "12"},
+            {"desired_version", "2"},
+            {"applied_version", "1"},
+            {"actual_present", "true"},
+            {"apply_status", "FAILED"},
+            {"last_error_code", "OCS_DEVICE_NOT_READY"},
+            {"last_error_message", "delete reply was not confirmed"},
+        });
+
+    ASSERT_TRUE(syncd_->pollDevice());
+    ASSERT_TRUE(syncd_->processOne("confirmed-delete-recovery"));
+    ASSERT_TRUE(orch_->processResultOne("confirmed-delete-result"));
+    ASSERT_TRUE(syncd_->pollDevice());
+    EXPECT_EQ(
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "confirmed-truth"))
+            .at("apply_status"),
+        "ABSENT");
+    EXPECT_TRUE(
+        device_db_->getHash(ocs::redis::connectionDeviceKey("ocs0", "confirmed-truth")).empty());
+    EXPECT_TRUE(
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "confirmed-truth")).empty());
+    EXPECT_EQ(
+        counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"))
+            .at("active_connections"),
+        "0");
 }
 
 TEST_F(OrchestratorIntegrationTest, RecoversConfirmedStateAfterStandaloneHwsimRestart) {

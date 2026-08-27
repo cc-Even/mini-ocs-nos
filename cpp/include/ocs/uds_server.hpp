@@ -23,6 +23,7 @@ public:
     Error start();
     void stop();
     [[nodiscard]] bool running() const noexcept;
+    void dropNextApplyReplyForTest() noexcept;
 
 private:
     struct ClientWorker {
@@ -39,6 +40,7 @@ private:
     std::shared_ptr<SimulatedOcsDevice> device_;
     std::atomic<int> listen_fd_{-1};
     std::atomic<bool> owns_socket_{false};
+    std::atomic<bool> drop_next_apply_reply_{false};
     std::jthread worker_;
     std::mutex clients_mutex_;
     std::vector<ClientWorker> client_workers_;

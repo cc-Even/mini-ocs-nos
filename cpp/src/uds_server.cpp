@@ -154,6 +154,10 @@ bool UdsServer::running() const noexcept {
     return listen_fd_.load() >= 0;
 }
 
+void UdsServer::dropNextApplyReplyForTest() noexcept {
+    drop_next_apply_reply_.store(true);
+}
+
 void UdsServer::acceptLoop(std::stop_token stop_token) {
     while (!stop_token.stop_requested()) {
         const int server_fd = listen_fd_.load();
@@ -201,6 +205,10 @@ void UdsServer::serveClient(int client_fd, std::stop_token stop_token) {
         }
 
         const auto response = dispatch(decoded.frame.value());
+        if (decoded.frame->message_type == uds::MessageType::kApplyConnections &&
+            drop_next_apply_reply_.exchange(false)) {
+            break;
+        }
         const auto encoded = uds::encode(response);
         if (!encoded.ok()) {
             break;

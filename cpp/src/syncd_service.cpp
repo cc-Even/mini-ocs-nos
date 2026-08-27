@@ -209,10 +209,10 @@ void SyncdService::initialize() {
             {"port_down_total", "0"},
             {"reconciliation_success_total", "0"},
             {"reconciliation_total", "0"},
-        });
+    });
     const auto actual = device_->getConnections();
     static_cast<void>(pollPortStates(info, actual));
-    publishServiceHeartbeat(true);
+    publishHwsimHeartbeat(true);
     const auto existing_state = state_db_.getHash(redis::deviceStateKey(info.name));
     if (existing_state.empty()) {
         state_db_.putHash(
@@ -277,7 +277,7 @@ bool SyncdService::pollDevice() {
             status->second != "READY") {
             publishDeviceState(info, actual.size(), "READY", Error::success());
         }
-        publishServiceHeartbeat(true);
+        publishHwsimHeartbeat(true);
         return true;
     } catch (const std::exception& error) {
         if (device_name_.empty()) {
@@ -303,31 +303,33 @@ bool SyncdService::pollDevice() {
                 "FAILED",
                 {ErrorCode::kDeviceNotReady, error.what()});
         }
-        publishServiceHeartbeat(false);
+        publishHwsimHeartbeat(false);
         return false;
     }
 }
 
-void SyncdService::publishServiceHeartbeat(bool hwsim_online) {
-    const auto now = std::to_string(timestampNowNs());
-    state_db_.putHashesAtomically({
+bool SyncdService::pollDeviceLiveness() {
+    try {
+        const auto info = device_->getDeviceInfo();
+        if (!device_name_.empty() && info.name != device_name_) {
+            throw std::runtime_error("connected device identity changed after handshake");
+        }
+        publishHwsimHeartbeat(true);
+        return true;
+    } catch (const std::exception&) {
+        publishHwsimHeartbeat(false);
+        return false;
+    }
+}
+
+void SyncdService::publishHwsimHeartbeat(bool online) {
+    state_db_.putHash(
+        redis::serviceStateKey("ocs-hwsim"),
         {
-            redis::serviceStateKey("ocs-syncd"),
-            {
-                {"service", "ocs-syncd"},
-                {"status", "ONLINE"},
-                {"last_seen_ns", now},
-            },
-        },
-        {
-            redis::serviceStateKey("ocs-hwsim"),
-            {
-                {"service", "ocs-hwsim"},
-                {"status", hwsim_online ? "ONLINE" : "OFFLINE"},
-                {"last_seen_ns", now},
-            },
-        },
-    });
+            {"service", "ocs-hwsim"},
+            {"status", online ? "ONLINE" : "OFFLINE"},
+            {"last_seen_ns", std::to_string(timestampNowNs())},
+        });
 }
 
 void SyncdService::publishDeviceState(
@@ -921,6 +923,65 @@ void SyncdService::reconcileDevice(
         return;
     }
     auto plan = buildReconciliationPlan(desired, actual);
+    bool confirmed_state_recovery_required = false;
+    if (plan.converged()) {
+        std::unordered_map<std::string, AppliedConnection> actual_by_id;
+        std::unordered_set<std::string> desired_ids;
+        for (const auto& connection : actual) {
+            actual_by_id.emplace(connection.id, connection);
+        }
+        for (const auto& command : desired) {
+            desired_ids.insert(command.id);
+            const auto found = actual_by_id.find(command.id);
+            if (found == actual_by_id.end()) {
+                continue;
+            }
+            const auto device_state = device_db_.getHash(
+                redis::connectionDeviceKey(info.name, command.id));
+            const auto confirmed_state = state_db_.getHash(
+                redis::connectionStateKey(info.name, command.id));
+            const auto failed = [](const auto& snapshot) {
+                return snapshot.contains("apply_status") &&
+                       snapshot.at("apply_status") == "FAILED";
+            };
+            if (!failed(device_state) && !failed(confirmed_state)) {
+                continue;
+            }
+            plan.drifts.push_back({
+                .id = command.id,
+                .kind = ConnectionDriftKind::kMismatched,
+                .desired = command,
+                .actual = found->second,
+            });
+            confirmed_state_recovery_required = true;
+        }
+        for (const auto& key : device_db_.scanKeys(
+                 redis::connectionDevicePattern(info.name))) {
+            const auto snapshot = device_db_.getHash(key);
+            if (!snapshot.contains("id") || desired_ids.contains(snapshot.at("id")) ||
+                !snapshot.contains("operation") || snapshot.at("operation") != "REMOVE" ||
+                !snapshot.contains("apply_status") || snapshot.at("apply_status") != "FAILED" ||
+                !snapshot.contains("desired_version") ||
+                actual_by_id.contains(snapshot.at("id"))) {
+                continue;
+            }
+            const ConnectionCommand removal{
+                .operation = ConnectionOperation::kRemove,
+                .id = snapshot.at("id"),
+                .desired_version = std::stoull(snapshot.at("desired_version")),
+            };
+            plan.full_snapshot.commands.push_back(removal);
+            plan.drifts.push_back({
+                .id = removal.id,
+                .kind = ConnectionDriftKind::kMissing,
+                .desired = removal,
+                .actual = {},
+            });
+            confirmed_state_recovery_required = true;
+        }
+        std::ranges::sort(plan.full_snapshot.commands, {}, &ConnectionCommand::id);
+        std::ranges::sort(plan.drifts, {}, &ConnectionDrift::id);
+    }
     auto port_faults = portFaults(info.name);
     const bool port_recovery_required = std::ranges::any_of(
         port_faults,
@@ -988,10 +1049,15 @@ void SyncdService::reconcileDevice(
     auto batch = plan.full_snapshot;
     const auto signature = encodeDeviceCommand(batch);
     std::string command_id;
-    const bool reopen_failed_port_recovery =
-        port_recovery_required && control.contains("status") &&
-        control.at("status") == "FAILED";
-    if (!reopen_failed_port_recovery && !control.empty() && control.contains("signature") &&
+    const bool reopen_failed_port_recovery = port_recovery_required &&
+                                             control.contains("status") &&
+                                             control.at("status") == "FAILED";
+    const bool reopen_failed_state_recovery =
+        confirmed_state_recovery_required && control.contains("status") &&
+        control.at("status") == "FAILED" &&
+        (!control.contains("reason") || control.at("reason") != "CONFIRMED_STATE_RECOVERY");
+    if (!reopen_failed_port_recovery && !reopen_failed_state_recovery && !control.empty() &&
+        control.contains("signature") &&
         control.at("signature") == signature && control.contains("status") &&
         control.at("status") != "CONVERGED") {
         if (control.at("status") != "PUBLISHING") {
@@ -1011,6 +1077,11 @@ void SyncdService::reconcileDevice(
             {"command_id", command_id},
             {"desired_version", std::to_string(desired_version)},
             {"signature", signature},
+            {"reason", port_recovery_required
+                           ? "PORT_RECOVERY"
+                           : (confirmed_state_recovery_required
+                                  ? "CONFIRMED_STATE_RECOVERY"
+                                  : "DESIRED_ACTUAL_DRIFT")},
             {"status", "PUBLISHING"},
             {"started_at_ns", std::to_string(timestampNowNs())},
         };
@@ -1276,6 +1347,49 @@ void SyncdService::clearDriftAlarm(
         {{"active_alarms", -1}}));
 }
 
+ApplyResult SyncdService::confirmAppliedResult(
+    const DeviceCommandBatch& batch,
+    ApplyResult result) {
+    if (result.ok() || batch.commands.empty()) {
+        return result;
+    }
+    try {
+        const auto actual = device_->getConnections();
+        std::unordered_map<std::string, AppliedConnection> actual_by_id;
+        for (const auto& connection : actual) {
+            actual_by_id.emplace(connection.id, connection);
+        }
+        std::vector<AppliedConnection> confirmed;
+        confirmed.reserve(batch.commands.size());
+        for (const auto& command : batch.commands) {
+            const auto found = actual_by_id.find(command.id);
+            if (command.operation == ConnectionOperation::kRemove) {
+                if (found != actual_by_id.end()) {
+                    return result;
+                }
+                continue;
+            }
+            if (found == actual_by_id.end() || found->second.input_port != command.input_port ||
+                found->second.output_port != command.output_port ||
+                found->second.applied_version != command.desired_version) {
+                return result;
+            }
+            const auto input = device_->getInputPortState(command.input_port);
+            const auto output = device_->getOutputPortState(command.output_port);
+            if (!input.admin_enabled || input.oper_status != PortOperStatus::kUp ||
+                !output.admin_enabled || output.oper_status != PortOperStatus::kUp) {
+                return result;
+            }
+            confirmed.push_back(found->second);
+        }
+        result.error = Error::success();
+        result.connections = std::move(confirmed);
+    } catch (const std::exception&) {
+        // Preserve the bounded apply error until a later device poll can confirm the outcome.
+    }
+    return result;
+}
+
 bool SyncdService::processOne(
     const std::string& consumer_name,
     const std::function<void()>& before_ack,
@@ -1335,6 +1449,7 @@ bool SyncdService::processOne(
                 {"payload", encodeDeviceCommand(batch)},
             }));
         ApplyResult result;
+        bool apply_attempted = false;
         const auto apply_started = std::chrono::steady_clock::now();
         try {
             const auto device_info = device_->getDeviceInfo();
@@ -1347,6 +1462,7 @@ bool SyncdService::processOne(
                 };
             } else {
                 try {
+                    apply_attempted = true;
                     result = device_->applyConnections(batch.commands, batch.options);
                 } catch (const std::exception& error) {
                     result.error = {ErrorCode::kProtocolMalformed, error.what()};
@@ -1354,6 +1470,9 @@ bool SyncdService::processOne(
             }
         } catch (const std::exception& error) {
             result.error = {ErrorCode::kDeviceNotReady, error.what()};
+        }
+        if (apply_attempted && !result.ok()) {
+            result = confirmAppliedResult(batch, std::move(result));
         }
         if (after_phase) {
             after_phase("device-apply");
@@ -1551,6 +1670,32 @@ long long SyncdService::publishState(
                                     ? actual_present->second == "true"
                                     : applied_version != previous_state.end() &&
                                           applied_version->second != "0";
+        const bool preserve_confirmed_port_state =
+            result.error.code == ErrorCode::kPortDown &&
+            command.operation == ConnectionOperation::kUpsert && was_active &&
+            previous_state.contains("apply_status") &&
+            previous_state.at("apply_status") == "ACTIVE" &&
+            previous_state.contains("input_port") &&
+            snapshotPort(previous_state, "input_port") == command.input_port &&
+            previous_state.contains("output_port") &&
+            snapshotPort(previous_state, "output_port") == command.output_port &&
+            previous_state.contains("desired_version") &&
+            std::stoull(previous_state.at("desired_version")) == command.desired_version &&
+            previous_state.contains("applied_version") &&
+            std::stoull(previous_state.at("applied_version")) == command.desired_version;
+        if (preserve_confirmed_port_state) {
+            static_cast<void>(state_db_.putHashIfAbsent(
+                publication_key,
+                {
+                    {"command_id", command_event.event_id},
+                    {"connection_id", command.id},
+                    {"active_delta", "0"},
+                    {"confirmed_unchanged", "true"},
+                }));
+            active_delta += std::stoll(
+                state_db_.getHash(publication_key).at("active_delta"));
+            continue;
+        }
         std::map<std::string, std::string> state;
         std::string operation = "UPSERT";
         if (result.ok() && command.operation == ConnectionOperation::kRemove) {
@@ -1656,6 +1801,19 @@ void SyncdService::publishResult(
         return;
     }
     for (const auto& command : batch.commands) {
+        ApplyResult command_result = result;
+        const auto state_publication = state_db_.getHash(
+            redis::syncdStatePublicationKey(command_event.event_id, command.id));
+        if (state_publication.contains("confirmed_unchanged") &&
+            state_publication.at("confirmed_unchanged") == "true") {
+            command_result.error = Error::success();
+            command_result.connections = {{
+                .id = command.id,
+                .input_port = command.input_port,
+                .output_port = command.output_port,
+                .applied_version = command.desired_version,
+            }};
+        }
         redis::EventEnvelope result_event{
             .event_schema_version = 1,
             .event_id = command_event.event_id + ":result:" + command.id,
@@ -1666,7 +1824,7 @@ void SyncdService::publishResult(
             .resource_id = command.id,
             .operation = "APPLY_RESULT",
             .desired_version = command.desired_version,
-            .payload = resultPayload(result, command_event.event_id),
+            .payload = resultPayload(command_result, command_event.event_id),
         };
         static_cast<void>(device_db_.appendEventOnce(
             redis::syncdResultPublicationKey(command_event.event_id, command.id),
