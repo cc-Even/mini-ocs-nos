@@ -79,6 +79,7 @@ struct ResetResult {
 
 enum class FaultType {
     kNextApplyError,
+    kNextApplyTimeout,
     kInputPortDown,
     kOutputPortDown,
 };

@@ -111,6 +111,13 @@ TEST_F(UdsTransportTest, FaultAndResetCallsCrossSocketBoundary) {
     EXPECT_EQ(failed.error.code, ocs::ErrorCode::kApplyFailed);
 
     ASSERT_TRUE(
+        backend_->injectFault({.type = ocs::FaultType::kNextApplyTimeout}).error.ok());
+    const auto timed_out = backend_->applyConnections(
+        {{.id = "conn-timeout", .input_port = 2, .output_port = 10, .desired_version = 1}},
+        {});
+    EXPECT_EQ(timed_out.error.code, ocs::ErrorCode::kApplyTimeout);
+
+    ASSERT_TRUE(
         backend_->injectFault({.type = ocs::FaultType::kInputPortDown, .port_id = 4}).error.ok());
     EXPECT_EQ(backend_->getInputPortState(4).oper_status, ocs::PortOperStatus::kDown);
     ASSERT_TRUE(

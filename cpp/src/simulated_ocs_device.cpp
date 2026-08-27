@@ -137,6 +137,10 @@ ApplyResult SimulatedOcsDevice::applyConnections(
         fail_next_apply_ = false;
         return finish({makeError(ErrorCode::kApplyFailed, "injected next-apply failure"), {}});
     }
+    if (timeout_next_apply_) {
+        timeout_next_apply_ = false;
+        return finish({makeError(ErrorCode::kApplyTimeout, "injected next-apply timeout"), {}});
+    }
 
     connections_.swap(candidate_connections);
     input_to_output_.swap(candidate_input_to_output);
@@ -185,6 +189,7 @@ ResetResult SimulatedOcsDevice::reset(ResetMode mode) {
     input_ports_ = makePorts(PortDirection::kInput, info_.input_port_count);
     output_ports_ = makePorts(PortDirection::kOutput, info_.output_port_count);
     fail_next_apply_ = false;
+    timeout_next_apply_ = false;
     apply_results_.clear();
     apply_result_order_.clear();
     if (mode == ResetMode::kHard) {
@@ -198,6 +203,10 @@ FaultResult SimulatedOcsDevice::injectFault(const FaultSpec& fault) {
     std::scoped_lock lock(mutex_);
     if (fault.type == FaultType::kNextApplyError) {
         fail_next_apply_ = true;
+        return {Error::success()};
+    }
+    if (fault.type == FaultType::kNextApplyTimeout) {
+        timeout_next_apply_ = true;
         return {Error::success()};
     }
 
@@ -215,6 +224,10 @@ FaultResult SimulatedOcsDevice::clearFault(const FaultSelector& selector) {
     std::scoped_lock lock(mutex_);
     if (selector.type == FaultType::kNextApplyError) {
         fail_next_apply_ = false;
+        return {Error::success()};
+    }
+    if (selector.type == FaultType::kNextApplyTimeout) {
+        timeout_next_apply_ = false;
         return {Error::success()};
     }
 

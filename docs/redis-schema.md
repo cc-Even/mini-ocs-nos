@@ -26,6 +26,11 @@ idempotent.
 `OCS_ORCH_DEVICE_COMMAND_PUBLISHED|event-id` fence its APPL_DB, DEVICE_DB, and
 atomic outbox phases respectively. Result phases use corresponding
 `OCS_ORCH_RESULT_*_PUBLISHED|result-event-id` markers.
+Apply timeouts additionally use `OCS_ORCH_TIMEOUT_*_PUBLISHED|command-id`
+phase markers and the reliable `OCS_DEVICE_RETRIES` stream. Retry application,
+device, and command markers fence resumption after an orch restart. Alarm and
+counter publication markers make raise/clear side effects idempotent across
+ALARM_DB and COUNTERS_DB.
 
 Every stream message uses this v1 envelope:
 
@@ -155,15 +160,18 @@ increments `device_apply_total` and one of `device_apply_success_total` or
 If an update or delete fails, syncd retains the last confirmed actual ports and
 applied version while advancing the desired version and recording `FAILED` plus
 the stable device error. A failed create without prior actual state uses applied
-version zero. Hash snapshots are replaced with a Redis transaction so readers
-cannot observe the intermediate delete used to remove obsolete fields.
+version zero. An `OCS_APPLY_TIMEOUT` result also increments
+`device_apply_timeout_total` in the same once-only counter publication. Hash
+snapshots are replaced with a Redis transaction so readers cannot observe the
+intermediate delete used to remove obsolete fields.
 
 Each processed batch appends one `APPLY_RESULT` event per command to
-`OCS_DEVICE_RESULTS`. Its payload records `success`, `error_code`, and
-`error_message`, while its envelope preserves the command request and that
-resource's desired version. syncd rejects an envelope whose device does not
-match the connected backend identity. It acknowledges the command only after
-the state, counters, and result publication steps have all completed.
+`OCS_DEVICE_RESULTS`. Its payload records `success`, `error_code`,
+`error_message`, and `command_id`, while its envelope preserves the command
+request and that resource's desired version. syncd rejects an envelope whose
+device does not match the connected backend identity. It acknowledges the
+command only after the state, counters, and result publication steps have all
+completed.
 
 Before applying a command, syncd checks the durable command marker and the last
 successful resource version. An already processed command ID, or a command no
@@ -242,6 +250,25 @@ Result handling conditionally persists the DEVICE_DB terminal snapshot or
 deletion first and the APPL_DB terminal snapshot second, with one per-event
 marker in each database. Recovery completes whichever phase is missing before
 ACK, while duplicate consumers cannot repeat either mutation.
+
+An `OCS_APPLY_TIMEOUT` result preserves desired configuration and confirmed
+actual state. orch transitions every member of the atomic command batch through
+`FAILED` to `RETRY_WAIT`, or leaves it `FAILED` after the configured retry
+limit, and appends one durable retry event for the whole batch. The retry loop
+does not ACK that event before its `not_before_ns` deadline. When due, it moves
+all still-current members back to `APPLYING`/`REMOVING` and publishes one new
+device command with a new operation ID. Delays double from
+`OCS_ORCH_APPLY_RETRY_BASE_MS` up to `OCS_ORCH_APPLY_RETRY_MAX_MS`; the number
+of retries is bounded by `OCS_ORCH_APPLY_MAX_RETRIES` (defaults: 100 ms, 5000
+ms, and 3 retries).
+
+Each timed-out connection owns the stable
+`OCS_ACTIVE_ALARM|device|apply-timeout-connection-id` alarm. Raising it appends
+an UPSERT to `OCS_ALARM_EVENTS` and increments `active_alarms` only for a new
+active lifecycle. A confirmed successful retry deletes the active snapshot,
+appends a REMOVE event, and decrements the counter once. Retry and alarm
+markers allow either orch process to resume these phases without duplicate
+commands, counters, or alarm events.
 
 APPL_DB's `desired_version` is the orchestrator's durable per-resource version.
 Events at or below that version are stale and are acknowledged without emitting

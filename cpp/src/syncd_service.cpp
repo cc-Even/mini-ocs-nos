@@ -24,11 +24,12 @@ std::uint64_t timestampNowNs() {
             .count());
 }
 
-std::string resultPayload(const ApplyResult& result) {
+std::string resultPayload(const ApplyResult& result, std::string_view command_id) {
     return nlohmann::json{
         {"success", result.ok()},
         {"error_code", toString(result.error.code)},
         {"error_message", result.error.message},
+        {"command_id", command_id},
     }.dump();
 }
 
@@ -189,6 +190,7 @@ bool SyncdService::processOne(
                 {"command_id", message.event.event_id},
                 {"device", message.event.device},
                 {"started_at_ns", std::to_string(timestampNowNs())},
+                {"payload", encodeDeviceCommand(batch)},
             }));
         ApplyResult result;
         try {
@@ -223,11 +225,14 @@ bool SyncdService::processOne(
     if (after_phase) {
         after_phase("state");
     }
-    const std::map<std::string, long long> counter_increments{
+    std::map<std::string, long long> counter_increments{
         {"device_apply_total", 1},
         {result.ok() ? "device_apply_success_total" : "device_apply_failure_total", 1},
         {"active_connections", active_delta},
     };
+    if (result.error.code == ErrorCode::kApplyTimeout) {
+        counter_increments["device_apply_timeout_total"] = 1;
+    }
     static_cast<void>(counters_db_.incrementHashFieldsOnce(
         redis::syncdCountersPublicationKey(message.event.event_id),
         {{"command_id", message.event.event_id}},
@@ -440,7 +445,7 @@ void SyncdService::publishResult(
             .resource_id = command_event.resource_id,
             .operation = "APPLY_RESULT",
             .desired_version = command_event.desired_version,
-            .payload = resultPayload(result),
+            .payload = resultPayload(result, command_event.event_id),
         };
         static_cast<void>(device_db_.appendEventOnce(
             redis::syncdResultPublicationKey(
@@ -464,7 +469,7 @@ void SyncdService::publishResult(
             .resource_id = command.id,
             .operation = "APPLY_RESULT",
             .desired_version = command.desired_version,
-            .payload = resultPayload(result),
+            .payload = resultPayload(result, command_event.event_id),
         };
         static_cast<void>(device_db_.appendEventOnce(
             redis::syncdResultPublicationKey(command_event.event_id, command.id),

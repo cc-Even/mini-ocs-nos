@@ -98,6 +98,7 @@ async def test_get_reads_stable_snapshots_from_all_operational_databases() -> No
             "id": "alarm-1",
             "severity": "MAJOR",
             "active": "true",
+            "first_raised_ns": "123400",
             "last_change_ns": "123456",
         },
     )
@@ -138,7 +139,13 @@ async def test_get_reads_stable_snapshots_from_all_operational_databases() -> No
         assert payloads[5] == {"id": 11, "oper-status": "UP"}
         assert payloads[6] == {"device-apply-success-total": 8, "device-apply-total": 9}
         assert payloads[7]["alarm"] == [
-            {"active": True, "id": "alarm-1", "last-change-ns": 123456, "severity": "MAJOR"}
+            {
+                "active": True,
+                "first-raised-ns": 123400,
+                "id": "alarm-1",
+                "last-change-ns": 123456,
+                "severity": "MAJOR",
+            }
         ]
         assert payloads[8] == payloads[7]["alarm"][0]
 

@@ -163,6 +163,26 @@ TEST(InProcessSimBackendTest, PreservesOldMatrixWhenInjectedApplyFails) {
     EXPECT_EQ(actual.front().id, "existing");
 }
 
+TEST(InProcessSimBackendTest, PreservesOldMatrixWhenInjectedApplyTimesOut) {
+    auto backend = makeBackend();
+    ASSERT_TRUE(
+        backend
+            ->applyConnections(
+                {{.id = "existing", .input_port = 1, .output_port = 9, .desired_version = 1}},
+                {})
+            .ok());
+    ASSERT_TRUE(
+        backend->injectFault({.type = ocs::FaultType::kNextApplyTimeout}).error.ok());
+
+    const auto result = backend->applyConnections(
+        {{.id = "new", .input_port = 2, .output_port = 10, .desired_version = 1}}, {});
+
+    EXPECT_EQ(result.error.code, ocs::ErrorCode::kApplyTimeout);
+    const auto actual = backend->getConnections();
+    ASSERT_EQ(actual.size(), 1);
+    EXPECT_EQ(actual.front().id, "existing");
+}
+
 TEST(InProcessSimBackendTest, ReplaysOriginalFailureForDuplicateOperationId) {
     auto backend = makeBackend();
     ASSERT_TRUE(backend->injectFault({.type = ocs::FaultType::kNextApplyError}).error.ok());

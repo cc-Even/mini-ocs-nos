@@ -42,6 +42,7 @@ private:
     std::map<std::string, ApplyResult> apply_results_;
     std::deque<std::string> apply_result_order_;
     bool fail_next_apply_{false};
+    bool timeout_next_apply_{false};
 };
 
 }  // namespace ocs

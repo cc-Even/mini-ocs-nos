@@ -6,6 +6,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <limits>
@@ -20,6 +21,7 @@ namespace ocs {
 namespace {
 
 inline constexpr std::string_view kConsumerGroup = "ocs-orch";
+inline constexpr std::string_view kRetryConsumerGroup = "ocs-orch-retry";
 
 std::uint64_t timestampNowNs() {
     return static_cast<std::uint64_t>(
@@ -165,6 +167,10 @@ ConnectionApplyStatus startApplyTransition(
         requireTransition(ConnectionApplyStatus::kRetryWait, executing);
         return executing;
     }
+    if (current == ConnectionApplyStatus::kRetryWait) {
+        requireTransition(current, executing);
+        return executing;
+    }
 
     const auto pending = operation == ConnectionOperation::kRemove
                              ? ConnectionApplyStatus::kPendingDelete
@@ -180,23 +186,86 @@ std::string operationName(ConnectionOperation operation) {
     return operation == ConnectionOperation::kRemove ? "REMOVE" : "UPSERT";
 }
 
+std::string resultCommandId(
+    const redis::EventEnvelope& event,
+    const nlohmann::json& result) {
+    const auto command_id = result.value("command_id", std::string{});
+    if (!command_id.empty()) {
+        return command_id;
+    }
+    const auto suffix = event.event_id.find(":result");
+    if (suffix == std::string::npos) {
+        throw std::invalid_argument("device result is missing command_id");
+    }
+    return event.event_id.substr(0, suffix);
+}
+
+std::uint64_t retryAtNs(
+    std::uint64_t now_ns,
+    std::size_t retry_attempt,
+    const ApplyRetryPolicy& policy) {
+    auto delay = policy.base_backoff;
+    for (std::size_t exponent = 1; delay.count() != 0 && exponent < retry_attempt;
+         ++exponent) {
+        if (delay >= policy.max_backoff / 2) {
+            delay = policy.max_backoff;
+            break;
+        }
+        delay *= 2;
+    }
+    delay = std::min(delay, policy.max_backoff);
+    return now_ns + static_cast<std::uint64_t>(delay.count()) * 1'000'000ULL;
+}
+
+std::string retryPayload(
+    const DeviceCommandBatch& batch,
+    std::string_view failed_command_id,
+    std::size_t retry_attempt,
+    std::uint64_t not_before_ns) {
+    return nlohmann::json{
+        {"batch", nlohmann::json::parse(encodeDeviceCommand(batch))},
+        {"failed_command_id", failed_command_id},
+        {"retry_attempt", retry_attempt},
+        {"not_before_ns", not_before_ns},
+    }.dump();
+}
+
+DeviceCommandBatch retryBatch(const nlohmann::json& payload) {
+    return decodeDeviceCommand(payload.at("batch").dump());
+}
+
+std::string alarmPayload(const std::map<std::string, std::string>& fields) {
+    return nlohmann::json(fields).dump();
+}
+
 }  // namespace
 
 OrchestratorService::OrchestratorService(
     redis::RedisEndpoint endpoint,
-    std::chrono::milliseconds pending_min_idle)
+    std::chrono::milliseconds pending_min_idle,
+    ApplyRetryPolicy retry_policy)
     : config_db_(endpoint, redis::LogicalDb::kConfig),
       appl_db_(endpoint, redis::LogicalDb::kAppl),
-      device_db_(std::move(endpoint), redis::LogicalDb::kDevice),
-      pending_min_idle_(pending_min_idle) {
+      device_db_(endpoint, redis::LogicalDb::kDevice),
+      alarm_db_(endpoint, redis::LogicalDb::kAlarm),
+      counters_db_(std::move(endpoint), redis::LogicalDb::kCounters),
+      pending_min_idle_(pending_min_idle),
+      retry_policy_(retry_policy) {
     if (pending_min_idle_.count() < 0 || pending_min_idle_ > std::chrono::hours(1)) {
         throw std::invalid_argument("orch pending minimum idle time is outside 0..3600000ms");
+    }
+    if (retry_policy_.max_retries > 100 || retry_policy_.base_backoff.count() < 0 ||
+        retry_policy_.max_backoff < retry_policy_.base_backoff ||
+        retry_policy_.max_backoff > std::chrono::hours(1)) {
+        throw std::invalid_argument("orch apply retry policy is outside supported bounds");
     }
 }
 
 void OrchestratorService::initialize() {
     config_db_.createConsumerGroup(std::string(redis::kConfigEvents), std::string(kConsumerGroup));
     device_db_.createConsumerGroup(std::string(redis::kDeviceResults), std::string(kConsumerGroup));
+    device_db_.createConsumerGroup(
+        std::string(redis::kDeviceRetries), std::string(kRetryConsumerGroup));
 }
 
 bool OrchestratorService::processConfigOne(
@@ -300,6 +369,9 @@ bool OrchestratorService::processConfigOne(
             {"request_id", message.event.request_id},
             {"event_id", message.event.event_id},
             {"command_id", command_id},
+            {"retry_attempt", "0"},
+            {"next_retry_at_ns", ""},
+            {"failed_command_id", ""},
             {"last_error_code", ""},
             {"last_error_message", ""},
         };
@@ -378,6 +450,17 @@ bool OrchestratorService::processResultOne(
     const auto& message = messages.front();
     const auto result = nlohmann::json::parse(message.event.payload);
     const auto success = result.at("success").get<bool>();
+    const auto error_code = result.at("error_code").get<std::string>();
+    if (!success && error_code == toString(ErrorCode::kApplyTimeout)) {
+        handleTimeoutResult(
+            message,
+            resultCommandId(message.event, result),
+            result.at("error_message").get<std::string>(),
+            after_phase);
+        static_cast<void>(device_db_.acknowledge(
+            std::string(redis::kDeviceResults), std::string(kConsumerGroup), message.id));
+        return true;
+    }
     const auto app_key = redis::connectionAppKey(message.event.device, message.event.resource_id);
     const auto device_key =
         redis::connectionDeviceKey(message.event.device, message.event.resource_id);
@@ -387,6 +470,9 @@ bool OrchestratorService::processResultOne(
         redis::orchResultDevicePublicationKey(message.event.event_id);
     if (!appl_db_.getHash(application_publication_key).empty() &&
         !device_db_.getHash(device_publication_key).empty()) {
+        if (success) {
+            clearTimeoutAlarm(message.event);
+        }
         static_cast<void>(device_db_.acknowledge(
             std::string(redis::kDeviceResults), std::string(kConsumerGroup), message.id));
         return true;
@@ -430,6 +516,11 @@ bool OrchestratorService::processResultOne(
         next == ConnectionApplyStatus::kAbsent
             ? ""
             : result.at("error_message").get<std::string>();
+    if (success) {
+        application["retry_attempt"] = "0";
+        application["next_retry_at_ns"] = "";
+        application["failed_command_id"] = "";
+    }
     static_cast<void>(device_db_.putVersionedHashesAtomicallyIfMarkerAbsent(
         device_publication_key,
         {
@@ -452,11 +543,411 @@ bool OrchestratorService::processResultOne(
     if (after_phase) {
         after_phase("application-result");
     }
+    if (success) {
+        clearTimeoutAlarm(message.event);
+        if (after_phase) {
+            after_phase("alarm-clear");
+        }
+    }
 
     const auto acknowledged = device_db_.acknowledge(
         std::string(redis::kDeviceResults), std::string(kConsumerGroup), message.id);
     static_cast<void>(acknowledged);
     return true;
+}
+
+void OrchestratorService::handleTimeoutResult(
+    const redis::StreamMessage& message,
+    const std::string& command_id,
+    const std::string& error_message,
+    const std::function<void(std::string_view)>& after_phase) {
+    const auto attempt = device_db_.getHash(redis::deviceApplyAttemptKey(command_id));
+    const auto payload = attempt.find("payload");
+    if (payload == attempt.end()) {
+        return;
+    }
+    DeviceCommandBatch batch;
+    try {
+        batch = decodeDeviceCommand(payload->second);
+    } catch (const std::exception&) {
+        return;
+    }
+    if (batch.commands.empty()) {
+        return;
+    }
+
+    const auto application_marker_key =
+        redis::orchTimeoutApplicationPublicationKey(command_id);
+    const auto device_marker_key = redis::orchTimeoutDevicePublicationKey(command_id);
+    auto metadata = appl_db_.getHash(application_marker_key);
+    if (metadata.empty()) {
+        metadata = device_db_.getHash(device_marker_key);
+    }
+
+    if (metadata.empty()) {
+        const auto first = appl_db_.getHash(
+            redis::connectionAppKey(message.event.device, batch.commands.front().id));
+        if (first.empty() || currentVersion(first) != message.event.desired_version ||
+            first.find("command_id") == first.end() || first.at("command_id") != command_id) {
+            return;
+        }
+        const auto current = currentStatus(first);
+        if (current != ConnectionApplyStatus::kApplying &&
+            current != ConnectionApplyStatus::kRemoving) {
+            return;
+        }
+        requireTransition(current, ConnectionApplyStatus::kFailed);
+        const auto attempt_value = first.find("retry_attempt");
+        const auto completed_retries = attempt_value == first.end()
+                                           ? std::size_t{}
+                                           : static_cast<std::size_t>(
+                                                 std::stoull(attempt_value->second));
+        const bool schedule_retry = completed_retries < retry_policy_.max_retries;
+        const auto next_attempt = schedule_retry ? completed_retries + 1 : completed_retries;
+        const auto next_status = schedule_retry ? ConnectionApplyStatus::kRetryWait
+                                                : ConnectionApplyStatus::kFailed;
+        if (schedule_retry) {
+            requireTransition(ConnectionApplyStatus::kFailed, next_status);
+        }
+        const auto next_retry_at = schedule_retry
+                                       ? retryAtNs(
+                                             timestampNowNs(), next_attempt, retry_policy_)
+                                       : std::uint64_t{};
+        metadata = {
+            {"command_id", command_id},
+            {"desired_version", std::to_string(message.event.desired_version)},
+            {"retry_attempt", std::to_string(next_attempt)},
+            {"next_retry_at_ns", std::to_string(next_retry_at)},
+            {"apply_status", std::string(toString(next_status))},
+            {"retry_scheduled", schedule_retry ? "true" : "false"},
+        };
+    }
+
+    std::vector<std::pair<std::string, std::map<std::string, std::string>>> applications;
+    std::vector<std::pair<std::string, std::map<std::string, std::string>>> device_states;
+    for (const auto& command : batch.commands) {
+        const auto app_key = redis::connectionAppKey(message.event.device, command.id);
+        auto application = appl_db_.getHash(app_key);
+        if (application.empty() || currentVersion(application) != command.desired_version ||
+            application.find("command_id") == application.end() ||
+            application.at("command_id") != command_id) {
+            return;
+        }
+        application["apply_status"] = metadata.at("apply_status");
+        application["retry_attempt"] = metadata.at("retry_attempt");
+        application["next_retry_at_ns"] = metadata.at("next_retry_at_ns");
+        application["failed_command_id"] = command_id;
+        application["last_error_code"] = std::string(toString(ErrorCode::kApplyTimeout));
+        application["last_error_message"] = error_message;
+        applications.push_back({app_key, application});
+        device_states.push_back({
+            redis::connectionDeviceKey(message.event.device, command.id), application});
+    }
+
+    static_cast<void>(device_db_.putVersionedHashesAtomicallyIfMarkerAbsent(
+        device_marker_key, metadata, device_states));
+    if (after_phase) {
+        after_phase("timeout-device");
+    }
+    static_cast<void>(appl_db_.putVersionedHashesAtomicallyIfMarkerAbsent(
+        application_marker_key, metadata, applications));
+    if (after_phase) {
+        after_phase("timeout-application");
+    }
+
+    for (const auto& command : batch.commands) {
+        auto alarm_event = message.event;
+        alarm_event.resource_id = command.id;
+        alarm_event.event_id = command_id + ":timeout-alarm:" + command.id;
+        publishTimeoutAlarm(alarm_event, error_message);
+    }
+    if (after_phase) {
+        after_phase("timeout-alarm");
+    }
+
+    if (metadata.at("retry_scheduled") == "true") {
+        const auto retry_attempt = static_cast<std::size_t>(
+            std::stoull(metadata.at("retry_attempt")));
+        const auto not_before_ns = std::stoull(metadata.at("next_retry_at_ns"));
+        const redis::EventEnvelope retry_event{
+            .event_schema_version = 1,
+            .event_id = command_id + ":retry:" + std::to_string(retry_attempt),
+            .request_id = message.event.request_id,
+            .timestamp_ns = timestampNowNs(),
+            .device = message.event.device,
+            .resource_type = batch.commands.size() == 1 ? "connection" : "connection-batch",
+            .resource_id = batch.commands.size() == 1 ? batch.commands.front().id
+                                                      : message.event.request_id,
+            .operation = "RETRY",
+            .desired_version = message.event.desired_version,
+            .payload = retryPayload(batch, command_id, retry_attempt, not_before_ns),
+        };
+        static_cast<void>(device_db_.appendEventOnce(
+            redis::orchRetryPublicationKey(command_id),
+            {
+                {"command_id", command_id},
+                {"retry_event_id", retry_event.event_id},
+                {"desired_version", std::to_string(message.event.desired_version)},
+            },
+            std::string(redis::kDeviceRetries),
+            retry_event));
+        if (after_phase) {
+            after_phase("timeout-retry");
+        }
+    }
+}
+
+bool OrchestratorService::processRetryOne(
+    const std::string& consumer_name,
+    const std::function<void(std::string_view)>& after_phase) {
+    auto messages = device_db_.claimPending(
+        std::string(redis::kDeviceRetries),
+        std::string(kRetryConsumerGroup),
+        consumer_name,
+        std::chrono::milliseconds(0),
+        1);
+    if (messages.empty()) {
+        messages = device_db_.readGroupIfNoPending(
+            std::string(redis::kDeviceRetries),
+            std::string(kRetryConsumerGroup),
+            consumer_name);
+    }
+    if (messages.empty()) {
+        return false;
+    }
+
+    const auto& message = messages.front();
+    const auto payload = nlohmann::json::parse(message.event.payload);
+    if (timestampNowNs() < payload.at("not_before_ns").get<std::uint64_t>()) {
+        return false;
+    }
+    const auto batch = retryBatch(payload);
+    const auto failed_command_id = payload.at("failed_command_id").get<std::string>();
+    const auto retry_attempt = payload.at("retry_attempt").get<std::size_t>();
+    const auto command_id = message.event.event_id + ":command";
+    const auto application_marker_key =
+        redis::orchRetryApplicationPublicationKey(message.event.event_id);
+    const auto device_marker_key = redis::orchRetryDevicePublicationKey(message.event.event_id);
+    const auto command_marker_key = redis::orchRetryCommandPublicationKey(message.event.event_id);
+
+    if (!device_db_.getHash(command_marker_key).empty()) {
+        static_cast<void>(device_db_.acknowledge(
+            std::string(redis::kDeviceRetries),
+            std::string(kRetryConsumerGroup),
+            message.id));
+        return true;
+    }
+
+    const bool retry_started = !appl_db_.getHash(application_marker_key).empty() ||
+                               !device_db_.getHash(device_marker_key).empty();
+    std::vector<std::pair<std::string, std::map<std::string, std::string>>> applications;
+    std::vector<std::pair<std::string, std::map<std::string, std::string>>> device_states;
+    for (const auto& command : batch.commands) {
+        const auto app_key = redis::connectionAppKey(message.event.device, command.id);
+        auto application = appl_db_.getHash(app_key);
+        const bool current_retry =
+            !application.empty() && currentVersion(application) == command.desired_version &&
+            application.find("command_id") != application.end() &&
+            (application.at("command_id") == failed_command_id ||
+             (retry_started && application.at("command_id") == command_id));
+        if (!current_retry ||
+            (!retry_started && currentStatus(application) != ConnectionApplyStatus::kRetryWait)) {
+            static_cast<void>(device_db_.acknowledge(
+                std::string(redis::kDeviceRetries),
+                std::string(kRetryConsumerGroup),
+                message.id));
+            return true;
+        }
+        if (!retry_started) {
+            const auto executing = command.operation == ConnectionOperation::kRemove
+                                       ? ConnectionApplyStatus::kRemoving
+                                       : ConnectionApplyStatus::kApplying;
+            requireTransition(ConnectionApplyStatus::kRetryWait, executing);
+            application["apply_status"] = std::string(toString(executing));
+        }
+        application["command_id"] = command_id;
+        application["retry_attempt"] = std::to_string(retry_attempt);
+        application["next_retry_at_ns"] = "";
+        application["failed_command_id"] = failed_command_id;
+        applications.push_back({app_key, application});
+        device_states.push_back({
+            redis::connectionDeviceKey(message.event.device, command.id), application});
+    }
+
+    const std::map<std::string, std::string> marker{
+        {"retry_event_id", message.event.event_id},
+        {"command_id", command_id},
+        {"desired_version", std::to_string(message.event.desired_version)},
+        {"retry_attempt", std::to_string(retry_attempt)},
+    };
+    static_cast<void>(appl_db_.putVersionedHashesAtomicallyIfMarkerAbsent(
+        application_marker_key, marker, applications));
+    if (after_phase) {
+        after_phase("retry-application");
+    }
+    static_cast<void>(device_db_.putVersionedHashesAtomicallyIfMarkerAbsent(
+        device_marker_key, marker, device_states));
+    if (after_phase) {
+        after_phase("retry-device");
+    }
+    static_cast<void>(device_db_.putHashIfAbsent(
+        redis::orchConfigBatchKey(message.event.event_id),
+        {
+            {"event_id", message.event.event_id},
+            {"request_id", message.event.request_id},
+            {"device", message.event.device},
+            {"payload", encodeDeviceCommand(batch)},
+        }));
+    const redis::EventEnvelope command_event{
+        .event_schema_version = 1,
+        .event_id = command_id,
+        .request_id = message.event.request_id,
+        .timestamp_ns = timestampNowNs(),
+        .device = message.event.device,
+        .resource_type = message.event.resource_type,
+        .resource_id = message.event.resource_id,
+        .operation = batch.commands.size() == 1
+                         ? operationName(batch.commands.front().operation)
+                         : "APPLY_BATCH",
+        .desired_version = message.event.desired_version,
+        .payload = encodeDeviceCommand(batch),
+    };
+    static_cast<void>(device_db_.appendEventOnce(
+        command_marker_key,
+        marker,
+        std::string(redis::kDeviceCommands),
+        command_event));
+    if (after_phase) {
+        after_phase("retry-command");
+    }
+    static_cast<void>(device_db_.acknowledge(
+        std::string(redis::kDeviceRetries),
+        std::string(kRetryConsumerGroup),
+        message.id));
+    return true;
+}
+
+void OrchestratorService::publishTimeoutAlarm(
+    const redis::EventEnvelope& result_event,
+    const std::string& error_message) {
+    const auto alarm_id = redis::applyTimeoutAlarmId(result_event.resource_id);
+    const auto key = redis::activeAlarmKey(result_event.device, alarm_id);
+    const auto marker_key = redis::orchAlarmPublicationKey(result_event.event_id);
+    auto marker = alarm_db_.getHash(marker_key);
+    const auto active = alarm_db_.getHash(key);
+    if (marker.empty()) {
+        const auto now = timestampNowNs();
+        const auto first_raised = active.find("first_raised_ns");
+        const auto existing_activation = active.find("activation_id");
+        const auto activation_id = existing_activation == active.end()
+                                       ? result_event.event_id
+                                       : existing_activation->second;
+        std::map<std::string, std::string> fields{
+            {"id", alarm_id},
+            {"active", "true"},
+            {"severity", "MAJOR"},
+            {"resource_type", "connection"},
+            {"resource_id", result_event.resource_id},
+            {"desired_version", std::to_string(result_event.desired_version)},
+            {"error_code", std::string(toString(ErrorCode::kApplyTimeout))},
+            {"error_message", error_message},
+            {"activation_id", activation_id},
+            {"first_raised_ns", first_raised == active.end()
+                                      ? std::to_string(now)
+                                      : first_raised->second},
+            {"last_change_ns", std::to_string(now)},
+        };
+        marker = {
+            {"alarm_id", alarm_id},
+            {"desired_version", std::to_string(result_event.desired_version)},
+            {"activation_id", activation_id},
+            {"activated", active.empty() ? "true" : "false"},
+        };
+        const redis::EventEnvelope alarm_event{
+            .event_schema_version = 1,
+            .event_id = result_event.event_id,
+            .request_id = result_event.request_id,
+            .timestamp_ns = now,
+            .device = result_event.device,
+            .resource_type = "alarm",
+            .resource_id = alarm_id,
+            .operation = "UPSERT",
+            .desired_version = result_event.desired_version,
+            .payload = alarmPayload(fields),
+        };
+        static_cast<void>(alarm_db_.replaceHashAndAppendEventOnce(
+            marker_key,
+            marker,
+            key,
+            fields,
+            std::string(redis::kAlarmEvents),
+            alarm_event));
+        marker = alarm_db_.getHash(marker_key);
+    }
+    if (marker.at("activated") == "true") {
+        static_cast<void>(counters_db_.incrementHashFieldsOnce(
+            redis::orchAlarmCounterPublicationKey(
+                result_event.device, alarm_id, marker.at("activation_id"), false),
+            {
+                {"alarm_id", alarm_id},
+                {"desired_version", std::to_string(result_event.desired_version)},
+            },
+            redis::deviceCountersKey(result_event.device),
+            {{"active_alarms", 1}}));
+    }
+}
+
+void OrchestratorService::clearTimeoutAlarm(const redis::EventEnvelope& result_event) {
+    const auto alarm_id = redis::applyTimeoutAlarmId(result_event.resource_id);
+    const auto key = redis::activeAlarmKey(result_event.device, alarm_id);
+    const auto marker_key = redis::orchAlarmClearPublicationKey(result_event.event_id);
+    auto marker = alarm_db_.getHash(marker_key);
+    auto active = alarm_db_.getHash(key);
+    if (marker.empty() && active.empty()) {
+        return;
+    }
+    if (marker.empty()) {
+        const auto desired_version = std::stoull(active.at("desired_version"));
+        const auto now = timestampNowNs();
+        active["active"] = "false";
+        active["last_change_ns"] = std::to_string(now);
+        marker = {
+            {"alarm_id", alarm_id},
+            {"desired_version", std::to_string(desired_version)},
+            {"activation_id", active.at("activation_id")},
+            {"cleared", "true"},
+        };
+        const redis::EventEnvelope alarm_event{
+            .event_schema_version = 1,
+            .event_id = result_event.event_id + ":alarm-clear",
+            .request_id = result_event.request_id,
+            .timestamp_ns = now,
+            .device = result_event.device,
+            .resource_type = "alarm",
+            .resource_id = alarm_id,
+            .operation = "REMOVE",
+            .desired_version = desired_version,
+            .payload = alarmPayload(active),
+        };
+        static_cast<void>(alarm_db_.replaceHashAndAppendEventOnce(
+            marker_key,
+            marker,
+            key,
+            {},
+            std::string(redis::kAlarmEvents),
+            alarm_event));
+        marker = alarm_db_.getHash(marker_key);
+    }
+    const auto desired_version = std::stoull(marker.at("desired_version"));
+    static_cast<void>(counters_db_.incrementHashFieldsOnce(
+        redis::orchAlarmCounterPublicationKey(
+            result_event.device, alarm_id, marker.at("activation_id"), true),
+        {
+            {"alarm_id", alarm_id},
+            {"desired_version", std::to_string(desired_version)},
+        },
+        redis::deviceCountersKey(result_event.device),
+        {{"active_alarms", -1}}));
 }
 
 }  // namespace ocs

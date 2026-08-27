@@ -101,11 +101,14 @@ protected:
             std::make_unique<ocs::redis::RedisRepository>(endpoint_, ocs::redis::LogicalDb::kState);
         counters_db_ = std::make_unique<ocs::redis::RedisRepository>(
             endpoint_, ocs::redis::LogicalDb::kCounters);
+        alarm_db_ =
+            std::make_unique<ocs::redis::RedisRepository>(endpoint_, ocs::redis::LogicalDb::kAlarm);
         config_db_->flushForTest();
         appl_db_->flushForTest();
         device_db_->flushForTest();
         state_db_->flushForTest();
         counters_db_->flushForTest();
+        alarm_db_->flushForTest();
 
         startServices();
     }
@@ -140,6 +143,7 @@ protected:
         device_db_.reset();
         state_db_.reset();
         counters_db_.reset();
+        alarm_db_.reset();
         if (hwsim_pid_ > 0) {
             ::kill(hwsim_pid_, SIGTERM);
             int status = 0;
@@ -158,6 +162,7 @@ protected:
     std::unique_ptr<ocs::redis::RedisRepository> device_db_;
     std::unique_ptr<ocs::redis::RedisRepository> state_db_;
     std::unique_ptr<ocs::redis::RedisRepository> counters_db_;
+    std::unique_ptr<ocs::redis::RedisRepository> alarm_db_;
     std::unique_ptr<ocs::OrchestratorService> orch_;
     std::unique_ptr<ocs::SyncdService> syncd_;
 };
@@ -199,6 +204,170 @@ TEST_F(OrchestratorIntegrationTest, ConfigEventReachesActiveThroughStandaloneHws
         device_db_->pendingCount(std::string(ocs::redis::kDeviceCommands), "ocs-syncd"), 0);
     EXPECT_EQ(
         device_db_->pendingCount(std::string(ocs::redis::kDeviceResults), "ocs-orch"), 0);
+}
+
+TEST_F(OrchestratorIntegrationTest, ApplyTimeoutRaisesAlarmAndRecoversAfterDurableRetry) {
+    orch_ = std::make_unique<ocs::OrchestratorService>(
+        endpoint_,
+        std::chrono::milliseconds(0),
+        ocs::ApplyRetryPolicy{
+            .max_retries = 2,
+            .base_backoff = std::chrono::milliseconds(20),
+            .max_backoff = std::chrono::milliseconds(40),
+        });
+    orch_->initialize();
+    syncd_.reset();
+    {
+        ocs::UdsDeviceBackend fault_backend(hwsim_socket_);
+        ASSERT_TRUE(
+            fault_backend.injectFault({.type = ocs::FaultType::kNextApplyTimeout}).error.ok());
+    }
+    syncd_ = std::make_unique<ocs::SyncdService>(
+        endpoint_, std::make_unique<ocs::UdsDeviceBackend>(hwsim_socket_));
+    syncd_->initialize();
+
+    const ocs::redis::EventEnvelope event{
+        .event_schema_version = 1,
+        .event_id = "event-timeout-recovery-001",
+        .request_id = "request-timeout-recovery-001",
+        .timestamp_ns = 1780000000000000030ULL,
+        .device = "ocs0",
+        .resource_type = "connection",
+        .resource_id = "conn-timeout-recovery-001",
+        .operation = "UPSERT",
+        .desired_version = 1,
+        .payload = R"({"input_port":6,"output_port":13})",
+    };
+    static_cast<void>(
+        config_db_->appendEvent(std::string(ocs::redis::kConfigEvents), event));
+    ASSERT_TRUE(orch_->processConfigOne("orch-timeout-config"));
+    ASSERT_TRUE(syncd_->processOne("syncd-timeout"));
+    ASSERT_TRUE(orch_->processResultOne("orch-timeout-result"));
+
+    const auto application = appl_db_->getHash(
+        ocs::redis::connectionAppKey("ocs0", "conn-timeout-recovery-001"));
+    EXPECT_EQ(application.at("apply_status"), "RETRY_WAIT");
+    EXPECT_EQ(application.at("last_error_code"), "OCS_APPLY_TIMEOUT");
+    const auto failed_state = state_db_->getHash(
+        ocs::redis::connectionStateKey("ocs0", "conn-timeout-recovery-001"));
+    EXPECT_EQ(failed_state.at("apply_status"), "FAILED");
+    EXPECT_EQ(failed_state.at("actual_present"), "false");
+    EXPECT_EQ(failed_state.at("applied_version"), "0");
+    const auto alarm_id = ocs::redis::applyTimeoutAlarmId("conn-timeout-recovery-001");
+    const auto alarm = alarm_db_->getHash(ocs::redis::activeAlarmKey("ocs0", alarm_id));
+    EXPECT_EQ(alarm.at("active"), "true");
+    EXPECT_EQ(alarm.at("error_code"), "OCS_APPLY_TIMEOUT");
+    auto counters = counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"));
+    EXPECT_EQ(counters.at("device_apply_timeout_total"), "1");
+    EXPECT_EQ(counters.at("active_alarms"), "1");
+
+    orch_.reset();
+    orch_ = std::make_unique<ocs::OrchestratorService>(
+        endpoint_,
+        std::chrono::milliseconds(0),
+        ocs::ApplyRetryPolicy{
+            .max_retries = 2,
+            .base_backoff = std::chrono::milliseconds(20),
+            .max_backoff = std::chrono::milliseconds(40),
+        });
+    orch_->initialize();
+    syncd_.reset();
+    {
+        ocs::UdsDeviceBackend fault_backend(hwsim_socket_);
+        ASSERT_TRUE(
+            fault_backend.clearFault({.type = ocs::FaultType::kNextApplyTimeout}).error.ok());
+    }
+    syncd_ = std::make_unique<ocs::SyncdService>(
+        endpoint_, std::make_unique<ocs::UdsDeviceBackend>(hwsim_socket_));
+    syncd_->initialize();
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool retry_published = false;
+    while (!retry_published && std::chrono::steady_clock::now() < deadline) {
+        retry_published = orch_->processRetryOne("orch-timeout-retry");
+        if (!retry_published) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+    ASSERT_TRUE(retry_published);
+    ASSERT_TRUE(syncd_->processOne("syncd-timeout-retry"));
+    ASSERT_TRUE(orch_->processResultOne("orch-timeout-retry-result"));
+
+    const auto active = appl_db_->getHash(
+        ocs::redis::connectionAppKey("ocs0", "conn-timeout-recovery-001"));
+    EXPECT_EQ(active.at("apply_status"), "ACTIVE");
+    const auto recovered_state = state_db_->getHash(
+        ocs::redis::connectionStateKey("ocs0", "conn-timeout-recovery-001"));
+    EXPECT_EQ(recovered_state.at("apply_status"), "ACTIVE");
+    EXPECT_EQ(recovered_state.at("desired_version"), recovered_state.at("applied_version"));
+    EXPECT_TRUE(
+        alarm_db_->getHash(ocs::redis::activeAlarmKey("ocs0", alarm_id)).empty());
+    counters = counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"));
+    EXPECT_EQ(counters.at("device_apply_total"), "2");
+    EXPECT_EQ(counters.at("device_apply_timeout_total"), "1");
+    EXPECT_EQ(counters.at("active_alarms"), "0");
+    EXPECT_FALSE(orch_->processResultOne("orch-timeout-retry-result"));
+    EXPECT_FALSE(orch_->processRetryOne("orch-timeout-retry"));
+}
+
+TEST_F(OrchestratorIntegrationTest, ExhaustsConfiguredApplyTimeoutRetries) {
+    orch_ = std::make_unique<ocs::OrchestratorService>(
+        endpoint_,
+        std::chrono::milliseconds(0),
+        ocs::ApplyRetryPolicy{
+            .max_retries = 2,
+            .base_backoff = std::chrono::milliseconds(0),
+            .max_backoff = std::chrono::milliseconds(0),
+        });
+    orch_->initialize();
+    const auto inject_timeout = [this] {
+        syncd_.reset();
+        {
+            ocs::UdsDeviceBackend fault_backend(hwsim_socket_);
+            ASSERT_TRUE(
+                fault_backend.injectFault({.type = ocs::FaultType::kNextApplyTimeout}).error.ok());
+        }
+        syncd_ = std::make_unique<ocs::SyncdService>(
+            endpoint_, std::make_unique<ocs::UdsDeviceBackend>(hwsim_socket_));
+        syncd_->initialize();
+    };
+
+    inject_timeout();
+    const ocs::redis::EventEnvelope event{
+        .event_schema_version = 1,
+        .event_id = "event-timeout-exhausted-001",
+        .request_id = "request-timeout-exhausted-001",
+        .timestamp_ns = 1780000000000000031ULL,
+        .device = "ocs0",
+        .resource_type = "connection",
+        .resource_id = "conn-timeout-exhausted-001",
+        .operation = "UPSERT",
+        .desired_version = 1,
+        .payload = R"({"input_port":6,"output_port":13})",
+    };
+    static_cast<void>(
+        config_db_->appendEvent(std::string(ocs::redis::kConfigEvents), event));
+    ASSERT_TRUE(orch_->processConfigOne("orch-timeout-exhausted-config"));
+    ASSERT_TRUE(syncd_->processOne("syncd-timeout-exhausted"));
+    ASSERT_TRUE(orch_->processResultOne("orch-timeout-exhausted-result"));
+
+    for (int retry = 0; retry < 2; ++retry) {
+        ASSERT_TRUE(orch_->processRetryOne("orch-timeout-exhausted-retry"));
+        inject_timeout();
+        ASSERT_TRUE(syncd_->processOne("syncd-timeout-exhausted"));
+        ASSERT_TRUE(orch_->processResultOne("orch-timeout-exhausted-result"));
+    }
+
+    const auto failed = appl_db_->getHash(
+        ocs::redis::connectionAppKey("ocs0", "conn-timeout-exhausted-001"));
+    EXPECT_EQ(failed.at("apply_status"), "FAILED");
+    EXPECT_EQ(failed.at("retry_attempt"), "2");
+    EXPECT_FALSE(orch_->processRetryOne("orch-timeout-exhausted-retry"));
+    const auto counters = counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"));
+    EXPECT_EQ(counters.at("device_apply_total"), "3");
+    EXPECT_EQ(counters.at("device_apply_timeout_total"), "3");
+    EXPECT_EQ(counters.at("device_apply_failure_total"), "3");
+    EXPECT_EQ(counters.at("active_alarms"), "1");
 }
 
 TEST_F(OrchestratorIntegrationTest, PreservesAtomicOutputSwapAsOneDeviceBatch) {
@@ -271,6 +440,106 @@ TEST_F(OrchestratorIntegrationTest, PreservesAtomicOutputSwapAsOneDeviceBatch) {
     EXPECT_EQ(
         appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "swap-b")).at("apply_status"),
         "ACTIVE");
+}
+
+TEST_F(OrchestratorIntegrationTest, RetriesTimedOutOutputSwapAsOneAtomicBatch) {
+    const auto initial_event = [](std::string id, ocs::PortId input, ocs::PortId output) {
+        return ocs::redis::EventEnvelope{
+            .event_schema_version = 1,
+            .event_id = "event-timeout-swap-initial-" + id,
+            .request_id = "request-timeout-swap-initial-" + id,
+            .timestamp_ns = 1780000000000000032ULL,
+            .device = "ocs0",
+            .resource_type = "connection",
+            .resource_id = id,
+            .operation = "UPSERT",
+            .desired_version = 1,
+            .payload = "{\"input_port\":" + std::to_string(input) +
+                       ",\"output_port\":" + std::to_string(output) + "}",
+        };
+    };
+    applyConfigEvent(initial_event("timeout-swap-a", 1, 9));
+    applyConfigEvent(initial_event("timeout-swap-b", 2, 10));
+    orch_ = std::make_unique<ocs::OrchestratorService>(
+        endpoint_,
+        std::chrono::milliseconds(0),
+        ocs::ApplyRetryPolicy{
+            .max_retries = 1,
+            .base_backoff = std::chrono::milliseconds(0),
+            .max_backoff = std::chrono::milliseconds(0),
+        });
+    orch_->initialize();
+    syncd_.reset();
+    {
+        ocs::UdsDeviceBackend fault_backend(hwsim_socket_);
+        ASSERT_TRUE(
+            fault_backend.injectFault({.type = ocs::FaultType::kNextApplyTimeout}).error.ok());
+    }
+    syncd_ = std::make_unique<ocs::SyncdService>(
+        endpoint_, std::make_unique<ocs::UdsDeviceBackend>(hwsim_socket_));
+    syncd_->initialize();
+
+    const ocs::DeviceCommandBatch swap{
+        .commands = {
+            {
+                .id = "timeout-swap-a",
+                .input_port = 1,
+                .output_port = 10,
+                .desired_version = 2,
+            },
+            {
+                .id = "timeout-swap-b",
+                .input_port = 2,
+                .output_port = 9,
+                .desired_version = 2,
+            },
+        },
+        .options = {},
+    };
+    const ocs::redis::EventEnvelope batch_event{
+        .event_schema_version = 1,
+        .event_id = "event-timeout-swap-batch-002",
+        .request_id = "request-timeout-swap-batch-002",
+        .timestamp_ns = 1780000000000000033ULL,
+        .device = "ocs0",
+        .resource_type = "connection-batch",
+        .resource_id = "request-timeout-swap-batch-002",
+        .operation = "APPLY_BATCH",
+        .desired_version = 2,
+        .payload = ocs::encodeDeviceCommand(swap),
+    };
+    static_cast<void>(config_db_->appendEvent(
+        std::string(ocs::redis::kConfigEvents), batch_event));
+    ASSERT_TRUE(orch_->processConfigOne("orch-timeout-swap"));
+    ASSERT_TRUE(syncd_->processOne("syncd-timeout-swap"));
+    ASSERT_TRUE(orch_->processResultOne("orch-timeout-swap-result"));
+    ASSERT_TRUE(orch_->processResultOne("orch-timeout-swap-result"));
+    EXPECT_EQ(
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "timeout-swap-a"))
+            .at("apply_status"),
+        "RETRY_WAIT");
+    EXPECT_EQ(
+        appl_db_->getHash(ocs::redis::connectionAppKey("ocs0", "timeout-swap-b"))
+            .at("apply_status"),
+        "RETRY_WAIT");
+
+    ASSERT_TRUE(orch_->processRetryOne("orch-timeout-swap-retry"));
+    ASSERT_TRUE(syncd_->processOne("syncd-timeout-swap-retry"));
+    ASSERT_TRUE(orch_->processResultOne("orch-timeout-swap-retry-result"));
+    ASSERT_TRUE(orch_->processResultOne("orch-timeout-swap-retry-result"));
+
+    const auto swap_a =
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "timeout-swap-a"));
+    const auto swap_b =
+        state_db_->getHash(ocs::redis::connectionStateKey("ocs0", "timeout-swap-b"));
+    EXPECT_EQ(swap_a.at("output_port"), "10");
+    EXPECT_EQ(swap_b.at("output_port"), "9");
+    EXPECT_EQ(swap_a.at("applied_version"), "2");
+    EXPECT_EQ(swap_b.at("applied_version"), "2");
+    EXPECT_EQ(
+        counters_db_->getHash(ocs::redis::deviceCountersKey("ocs0"))
+            .at("device_apply_total"),
+        "4");
 }
 
 TEST_F(OrchestratorIntegrationTest, RecoversWholeAtomicBatchAfterApplicationPhaseCrash) {

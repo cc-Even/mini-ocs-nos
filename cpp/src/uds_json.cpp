@@ -62,6 +62,8 @@ std::string_view faultName(FaultType type) {
     switch (type) {
         case FaultType::kNextApplyError:
             return "NEXT_APPLY_ERROR";
+        case FaultType::kNextApplyTimeout:
+            return "NEXT_APPLY_TIMEOUT";
         case FaultType::kInputPortDown:
             return "INPUT_PORT_DOWN";
         case FaultType::kOutputPortDown:
@@ -71,6 +73,9 @@ std::string_view faultName(FaultType type) {
 }
 
 FaultType parseFault(std::string_view value) {
+    if (value == "NEXT_APPLY_TIMEOUT") {
+        return FaultType::kNextApplyTimeout;
+    }
     if (value == "INPUT_PORT_DOWN") {
         return FaultType::kInputPortDown;
     }

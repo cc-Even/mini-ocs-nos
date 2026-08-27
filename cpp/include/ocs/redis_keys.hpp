@@ -17,6 +17,7 @@ enum class LogicalDb : int {
 inline constexpr std::string_view kConfigEvents = "OCS_CONFIG_EVENTS";
 inline constexpr std::string_view kDeviceCommands = "OCS_DEVICE_COMMANDS";
 inline constexpr std::string_view kDeviceResults = "OCS_DEVICE_RESULTS";
+inline constexpr std::string_view kDeviceRetries = "OCS_DEVICE_RETRIES";
 inline constexpr std::string_view kStateEvents = "OCS_STATE_EVENTS";
 inline constexpr std::string_view kAlarmEvents = "OCS_ALARM_EVENTS";
 inline constexpr std::string_view kFaultCommands = "OCS_FAULT_COMMANDS";
@@ -88,6 +89,34 @@ inline constexpr std::string_view kFaultCommands = "OCS_FAULT_COMMANDS";
     return "OCS_ORCH_RESULT_DEVICE_PUBLISHED|" + std::string(result_event_id);
 }
 
+[[nodiscard]] inline std::string orchTimeoutApplicationPublicationKey(
+    std::string_view command_id) {
+    return "OCS_ORCH_TIMEOUT_APPLICATION_PUBLISHED|" + std::string(command_id);
+}
+
+[[nodiscard]] inline std::string orchTimeoutDevicePublicationKey(std::string_view command_id) {
+    return "OCS_ORCH_TIMEOUT_DEVICE_PUBLISHED|" + std::string(command_id);
+}
+
+[[nodiscard]] inline std::string orchRetryPublicationKey(std::string_view command_id) {
+    return "OCS_ORCH_RETRY_PUBLISHED|" + std::string(command_id);
+}
+
+[[nodiscard]] inline std::string orchRetryApplicationPublicationKey(
+    std::string_view retry_event_id) {
+    return "OCS_ORCH_RETRY_APPLICATION_PUBLISHED|" + std::string(retry_event_id);
+}
+
+[[nodiscard]] inline std::string orchRetryDevicePublicationKey(
+    std::string_view retry_event_id) {
+    return "OCS_ORCH_RETRY_DEVICE_PUBLISHED|" + std::string(retry_event_id);
+}
+
+[[nodiscard]] inline std::string orchRetryCommandPublicationKey(
+    std::string_view retry_event_id) {
+    return "OCS_ORCH_RETRY_COMMAND_PUBLISHED|" + std::string(retry_event_id);
+}
+
 [[nodiscard]] inline std::string deviceApplyAttemptKey(std::string_view command_id) {
     return "OCS_DEVICE_APPLY_ATTEMPT|" + std::string(command_id);
 }
@@ -155,6 +184,28 @@ inline constexpr std::string_view kFaultCommands = "OCS_FAULT_COMMANDS";
     std::string_view device,
     std::string_view alarm_id) {
     return "OCS_ACTIVE_ALARM|" + std::string(device) + "|" + std::string(alarm_id);
+}
+
+[[nodiscard]] inline std::string applyTimeoutAlarmId(std::string_view connection_id) {
+    return "apply-timeout-" + std::string(connection_id);
+}
+
+[[nodiscard]] inline std::string orchAlarmPublicationKey(std::string_view result_event_id) {
+    return "OCS_ORCH_ALARM_PUBLISHED|" + std::string(result_event_id);
+}
+
+[[nodiscard]] inline std::string orchAlarmClearPublicationKey(std::string_view result_event_id) {
+    return "OCS_ORCH_ALARM_CLEAR_PUBLISHED|" + std::string(result_event_id);
+}
+
+[[nodiscard]] inline std::string orchAlarmCounterPublicationKey(
+    std::string_view device,
+    std::string_view alarm_id,
+    std::string_view activation_id,
+    bool clear) {
+    return "OCS_ORCH_ALARM_COUNTER_" + std::string(clear ? "CLEARED|" : "RAISED|") +
+           std::string(device) + "|" + std::string(alarm_id) + "|" +
+           std::string(activation_id);
 }
 
 }  // namespace ocs::redis
