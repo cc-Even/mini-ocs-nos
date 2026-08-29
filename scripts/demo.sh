@@ -109,6 +109,11 @@ printf '\n==> 7. Captured ON_CHANGE stream\n'
 sed -n '1,240p' "${DEMO_LOG_DIR}/connection-watch.log"
 
 printf '\n==> 8. Run isolated packaged E2E and print its summary\n'
-env OCS_ENABLE_FAULT_API=1 OCS_TEST_LOG_DIR="${DEMO_LOG_DIR}/e2e" make e2e
+env \
+    OCS_ENABLE_FAULT_API=1 \
+    OCS_ORCH_APPLY_RETRY_BASE_MS=100 \
+    OCS_ORCH_APPLY_RETRY_MAX_MS=5000 \
+    OCS_TEST_LOG_DIR="${DEMO_LOG_DIR}/e2e" \
+    make e2e
 
 printf '\nDemo completed successfully. Logs: %s\n' "${DEMO_LOG_DIR}"
