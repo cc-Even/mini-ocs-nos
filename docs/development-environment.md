@@ -6,6 +6,7 @@
 - Docker Engine with Docker Compose
 - Python 3.12 managed by pinned `uv` 0.12.1
 - CMake 3.25 or newer and a C++20 compiler
+- Node.js 22.12 or newer and npm for local dashboard builds/tests
 - GNU Make and Git
 
 Run:
@@ -15,8 +16,8 @@ scripts/bootstrap.sh
 ```
 
 The bootstrap installs only the pinned user-space Python tool manager and Python
-3.12. It does not attempt privileged Docker installation. It finishes by running
-the strict preflight gate.
+3.12. It does not attempt privileged Docker or Node.js installation. It finishes
+by running the strict preflight gate.
 
 ## WSL2 and Docker Desktop
 
@@ -38,6 +39,11 @@ not sufficient. A native Docker Engine installation is also supported when both
 the 3.12 line when bootstrap is rerun, while the `uv` tool itself remains pinned.
 Application dependencies will be locked separately by the Python project in
 Iteration 02.
+
+The dashboard production builder pins Node 22.22.3 by immutable container
+digest. `web/package-lock.json` pins the TypeScript/Vite/Vitest/Playwright
+toolchain and all transitive npm dependencies. A newer compatible host Node may
+run local checks, but image and browser acceptance remain on the pinned tools.
 
 ## Hardened test profiles
 

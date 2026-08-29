@@ -18,8 +18,9 @@ switch components.
 ## Quick start
 
 Prerequisites are Linux or WSL2, Docker Engine with Compose, Git, GNU Make,
-CMake 3.25 or newer, and a C++20 compiler. The bootstrap script installs pinned
-`uv` 0.12.1 and Python 3.12 in user space, then runs preflight checks.
+CMake 3.25 or newer, a C++20 compiler, and Node.js 22.12 or newer for local
+dashboard tests. The bootstrap script installs pinned `uv` 0.12.1 and Python
+3.12 in user space, then runs preflight checks.
 
 ```bash
 make bootstrap
@@ -32,6 +33,8 @@ uv run --frozen ocsctl connection create ocs0 conn-001 --input 3 --output 11
 uv run --frozen ocsctl connection list ocs0
 uv run --frozen ocsctl diagnostics show ocs0
 
+# Interactive matrix dashboard: http://127.0.0.1:8080
+
 make down
 ```
 
@@ -39,13 +42,14 @@ make down
 gNMI server, and the separately packaged gNMI-only web gateway, then waits for
 their dependency-aware health checks. The default gNMI endpoint is
 `127.0.0.1:50051`; the bounded REST/WebSocket gateway is
-`http://127.0.0.1:8080`. `make down` stops the services but preserves the named
-Redis volume; `docker compose down --volumes` also deletes local runtime data.
+`http://127.0.0.1:8080`, including the interactive 16×16 dashboard. `make down`
+stops the services but preserves the named Redis volume; `docker compose down
+--volumes` also deletes local runtime data.
 
 ### 中文快速开始
 
-请先安装 Linux/WSL2、Docker Engine 与 Compose、Git、GNU Make、CMake 3.25+
-和支持 C++20 的编译器，然后执行：
+请先安装 Linux/WSL2、Docker Engine 与 Compose、Git、GNU Make、CMake 3.25+、
+支持 C++20 的编译器，以及用于本地前端测试的 Node.js 22.12+，然后执行：
 
 ```bash
 make bootstrap       # 安装固定版本的 uv/Python，并检查开发环境
@@ -181,13 +185,14 @@ the packaged E2E summary. See [Demo](docs/demo.md) and the validated
 ## Build and test
 
 ```bash
-make test                         # C++/Python unit suites and Ruff
+make test                         # C++/Python/dashboard unit suites, build, Ruff
 make redis-integration-test       # real Redis + standalone service processes
 make sanitizer-test               # C++ unit suite under ASan/UBSan
 make sanitizer-integration-test   # Redis integration under ASan/UBSan
 make image                        # all five non-root service images
 make e2e                          # isolated full-Compose gNMI vertical slice
 make demo                         # guided operator flow plus packaged E2E
+npm run --prefix web test         # dashboard SVG/API unit tests
 ```
 
 The integration harness removes its temporary containers and volumes and saves
@@ -210,6 +215,7 @@ failure artifacts.
 - [Redis state and event contract](docs/redis-schema.md)
 - [CLI workflows](docs/cli.md)
 - [Web gateway contract](docs/web-gateway.md)
+- [Interactive dashboard](docs/dashboard.md)
 - [Development environment](docs/development-environment.md)
 - [Structured logging contract](docs/logging.md)
 - [Architecture decision records](docs/decisions/README.md)

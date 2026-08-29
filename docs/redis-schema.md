@@ -138,7 +138,7 @@ result within its bounded transaction deadline; Redis/UDS dependency errors
 never become false success.
 
 These hashes are recovery/idempotency records, not configuration or operational
-state. `ocsctl` and the future web gateway do not access them directly, and the
+state. `ocsctl` and the web gateway do not access them directly, and the
 non-idempotent `OUT_OF_BAND_DRIFT` fixture is intentionally not accepted by
 this stream.
 

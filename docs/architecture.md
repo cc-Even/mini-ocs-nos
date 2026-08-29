@@ -45,6 +45,7 @@ containing that path; they do not communicate through an in-process shortcut.
 |---|---|---|
 | `ocsctl` | Human/JSON workflows, RPC deadlines, bounded watches | Redis keys, hardware state |
 | `web-gateway` | Bounded browser REST/WebSocket, gNMI translation and reconnect | Redis keys, UDS, hardware state |
+| `dashboard` | SVG visualization, user workflows, confirmed-state distinction | gNMI, Redis, UDS, device truth |
 | `gnmi-server` | Capabilities/Get/Set/Subscribe, path and payload validation, atomic desired-state commit | Hardware apply success |
 | `ocs-orch` | Connection state machine, durable config/result consumption, retry policy, application state and timeout alarms | UDS or simulator calls |
 | `ocs-syncd` | Device command consumption, UDS calls, confirmed state/counters, generation refresh, drift/port reconciliation | Desired-state admission |

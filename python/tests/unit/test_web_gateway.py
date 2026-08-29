@@ -214,6 +214,20 @@ def test_request_body_limit_and_grpc_dependency_error_are_stable() -> None:
     }
 
 
+def test_gateway_serves_the_built_dashboard_without_shadowing_api(tmp_path) -> None:
+    (tmp_path / "index.html").write_text("<h1>dashboard asset</h1>", encoding="utf-8")
+    factory = FakeClientFactory()
+    app = create_app(settings(static_directory=str(tmp_path)), factory)
+
+    with TestClient(app) as client:
+        dashboard = client.get("/")
+        health = client.get("/healthz")
+
+    assert dashboard.status_code == 200
+    assert "dashboard asset" in dashboard.text
+    assert health.status_code == 200
+
+
 def test_websocket_reconnects_and_cancels_the_gnmi_subscription_on_disconnect() -> None:
     factory = FakeClientFactory()
     factory.subscription_failures = 1

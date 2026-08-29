@@ -45,6 +45,7 @@ class GatewaySettings:
     websocket_queue_size: int = 64
     max_request_body_bytes: int = 16_384
     max_websocket_message_bytes: int = 4_096
+    static_directory: str = ""
 
     @classmethod
     def from_environment(cls) -> GatewaySettings:
@@ -72,4 +73,5 @@ class GatewaySettings:
             max_websocket_message_bytes=_integer(
                 "OCS_WEB_MAX_MESSAGE_BYTES", "4096", minimum=256, maximum=65_536
             ),
+            static_directory=os.getenv("OCS_WEB_STATIC_DIR", ""),
         )

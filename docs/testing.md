@@ -8,14 +8,15 @@ deadlines and polling rather than relying on one short fixed sleep.
 
 | Command | Coverage | External requirements |
 |---|---|---|
-| `make test` | C++ unit/contracts, Python unit tests, Ruff | Compiler, CMake, Python; Redis tests skip |
+| `make test` | C++/Python/dashboard unit tests, dashboard build, Ruff | Compiler, CMake, Python, Node.js 22.12+; Redis tests skip |
 | `make redis-integration-test` | Redis contracts, orch/syncd, reliability C–H, real gNMI/CLI process tests | Docker daemon and Unix sockets |
 | `make sanitizer-test` | Non-Redis C++ suite with ASan/UBSan/leak detection | GCC or Clang |
 | `make sanitizer-integration-test` | Redis-dependent C++ suite with ASan/UBSan | Docker daemon |
 | `make image` | All pinned, non-root service image targets | Docker daemon |
 | `make up` | Complete dependency-gated runtime health | Docker daemon; localhost ports 50051 and 8080 |
 | `make e2e` | Fresh isolated Compose stack through gNMI and its web adapter | Docker daemon; ports 50052 and 8082 by default |
-| `make demo` | Guided operator flow, managed fault/recovery, diagnostics, and packaged E2E | Docker daemon; localhost ports 50053 and 50052 by default |
+| `npm run --prefix web test` | SVG matrix and browser API unit contracts | Node.js 22.12+ |
+| `make demo` | Guided operator flow, managed fault/recovery, diagnostics, and packaged E2E | Docker daemon; localhost ports 50053, 8083, 50052, and 8082 |
 
 Run `make down` after manual Compose use. The integration and E2E harnesses have
 their own cleanup traps. The E2E project name and port can be overridden with
@@ -24,7 +25,8 @@ their own cleanup traps. The E2E project name and port can be overridden with
 `make demo` uses its own Compose project, enables the otherwise closed simulator
 fault API only inside that stack, stores logs below `artifacts/demo/`, and
 removes its containers, networks, and volumes on exit. Override its project and
-port with `OCS_DEMO_PROJECT_NAME` and `OCS_DEMO_GNMI_PORT`.
+ports with `OCS_DEMO_PROJECT_NAME`, `OCS_DEMO_GNMI_PORT`, and
+`OCS_DEMO_WEB_PORT`.
 
 ## Test layers
 
@@ -70,10 +72,18 @@ management, CLI behavior, service restarts, diagnostics, and scenarios A–H.
 ### Compose E2E
 
 `make e2e` creates an isolated full stack, waits for all health checks, and uses
-only the published gNMI endpoint. It creates three connections, waits for
-ACTIVE with matching versions/counters, then verifies that a conflicting
-two-member batch is atomically rejected and absent from both configuration and
-operational reads. Cleanup removes this test project's volumes.
+the published gNMI and localhost web endpoints. It creates three connections,
+waits for ACTIVE with matching versions/counters, then verifies that a
+conflicting two-member batch is atomically rejected and absent from both
+configuration and operational reads.
+
+The harness also enables the otherwise closed simulator fault API only inside
+its isolated project and runs a pinned official Playwright/Chromium container.
+The browser loads the packaged dashboard, observes WebSocket synchronization,
+creates an ACTIVE circuit, verifies the SVG crosspoint and counters, injects and
+clears a supported demo fault, deletes the circuit, and makes no request outside
+the gateway origin. The browser-test profile is absent from normal startup.
+Cleanup removes the test project's containers, networks, and volumes.
 
 ### Reproducible operator demo
 
@@ -105,9 +115,10 @@ repository permissions:
 
 1. Python dependency sync, lint, and pytest;
 2. C++ configure, build, and CTest;
-3. ASan/UBSan unit and Redis integration runs;
-4. real Redis and service-process integration;
-5. full Compose build, health, reproducible demo, and E2E.
+3. pinned TypeScript build and SVG/API unit tests;
+4. ASan/UBSan unit and Redis integration runs;
+5. real Redis and service-process integration;
+6. full Compose build, health, reproducible demo, and browser E2E.
 
 Failed jobs upload relevant logs for 14 days. Compose cleanup runs even when a
 job fails.

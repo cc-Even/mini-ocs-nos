@@ -5,9 +5,10 @@ boundary. It translates a deliberately small HTTP/WebSocket contract into gNMI
 Get, Set, and ON_CHANGE Subscribe calls. It does not import a Redis client, know
 Redis keys, mount the hwsim runtime volume, or open the simulator UDS.
 
-Compose exposes the gateway at `http://127.0.0.1:8080` by default. The interface
-is insecure and unauthenticated for local development only. Do not bind it to an
-untrusted network.
+Compose exposes the gateway at `http://127.0.0.1:8080` by default and serves the
+packaged [interactive dashboard](dashboard.md) at `/`. The interface is insecure
+and unauthenticated for local development only. Do not bind it to an untrusted
+network.
 
 ## REST contract
 

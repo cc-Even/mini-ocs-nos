@@ -89,6 +89,20 @@ check_python() {
     pass "python: ${python_version} (${python_path})"
 }
 
+check_node() {
+    if ! command -v node >/dev/null 2>&1; then
+        fail "Node.js 22.12 or newer is required for dashboard checks"
+        return
+    fi
+    local node_version
+    node_version=$(node --version)
+    if ! node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 12) ? 0 : 1)'; then
+        fail "Node.js 22.12 or newer is required, found ${node_version}"
+        return
+    fi
+    pass "node: ${node_version}"
+}
+
 check_docker() {
     local docker_cli
     if ! docker_cli=$(resolve_docker); then
@@ -121,6 +135,8 @@ check_command git --version
 check_command cmake --version
 check_command g++ --version
 check_command make --version
+check_node
+check_command npm --version
 check_python
 check_docker
 

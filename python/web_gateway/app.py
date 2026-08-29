@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import time
 from contextlib import suppress
+from pathlib import Path as FilesystemPath
 from typing import Annotated, Any, Final
 
 import grpc
 from fastapi import FastAPI, Path, Query, Request, WebSocket, status
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from ocsctl.client import ConnectionSpec
 from starlette.websockets import WebSocketState
 
@@ -305,6 +307,12 @@ def create_app(
             if not disconnected and websocket.application_state is WebSocketState.CONNECTED:
                 with suppress(RuntimeError):
                     await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
+
+    if settings.static_directory:
+        static_directory = FilesystemPath(settings.static_directory)
+        if not (static_directory / "index.html").is_file():
+            raise RuntimeError("dashboard static directory does not contain index.html")
+        app.mount("/", StaticFiles(directory=static_directory, html=True), name="dashboard")
 
     return app
 

@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Mini OCS Control Surface</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">SONiC-inspired control plane</p>
+          <h1>Mini OCS <span>Control Surface</span></h1>
+        </div>
+        <div class="live-state" aria-live="polite">
+          <span id="stream-dot" class="status-dot offline"></span>
+          <span id="stream-status">Connecting telemetry</span>
+        </div>
+      </header>
+
+      <main>
+        <div id="error-banner" class="error-banner hidden" role="alert"></div>
+
+        <section class="hero-panel panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">ocs0 / optical fabric</p>
+              <h2>16 × 16 circuit matrix</h2>
+            </div>
+            <button id="refresh-button" class="ghost-button" type="button">Refresh snapshot</button>
+          </div>
+          <div class="matrix-layout">
+            <div class="matrix-wrap">
+              <svg
+                id="matrix"
+                viewBox="0 0 620 620"
+                role="img"
+                aria-label="Input to output optical connection matrix"
+              ></svg>
+              <div class="legend" aria-label="Matrix legend">
+                <span><i class="legend-actual"></i>Confirmed actual</span>
+                <span><i class="legend-desired"></i>Desired pending</span>
+                <span><i class="legend-fault"></i>Port unavailable</span>
+              </div>
+            </div>
+            <div class="metric-stack">
+              <article><span>Device</span><strong id="device-health">UNKNOWN</strong></article>
+              <article><span>Active circuits</span><strong id="active-connections">0</strong></article>
+              <article><span>Desired / actual</span><strong id="desired-actual">0 / 0</strong></article>
+              <article><span>Active alarms</span><strong id="active-alarms">0</strong></article>
+              <article><span>Configuration revision</span><strong id="config-revision">0</strong></article>
+            </div>
+          </div>
+        </section>
+
+        <section class="two-column">
+          <article class="panel">
+            <div class="section-heading compact">
+              <div>
+                <p class="eyebrow">desired → confirmed</p>
+                <h2>Connections</h2>
+              </div>
+            </div>
+            <form id="connection-form" class="operation-form">
+              <label>Connection ID<input name="connection-id" value="web-001" required pattern="[A-Za-z0-9_.-]{1,128}" /></label>
+              <label>Input<input name="input-port" type="number" value="1" min="1" max="16" required /></label>
+              <label>Output<input name="output-port" type="number" value="9" min="1" max="16" required /></label>
+              <label>Operation<select name="operation"><option>UPDATE</option><option>REPLACE</option></select></label>
+              <button id="connection-submit" type="submit">Apply desired state</button>
+            </form>
+            <div class="table-wrap">
+              <table id="connections-table">
+                <thead><tr><th>ID</th><th>Desired</th><th>Actual</th><th>Status</th><th></th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="panel">
+            <div class="section-heading compact">
+              <div>
+                <p class="eyebrow">development profile only</p>
+                <h2>Fault workflow</h2>
+              </div>
+            </div>
+            <form id="fault-form" class="fault-form">
+              <label>Fault<select name="fault" id="fault-kind">
+                <option value="NEXT_APPLY_TIMEOUT">Next apply timeout</option>
+                <option value="NEXT_APPLY_ERROR">Next apply error</option>
+                <option value="INPUT_PORT_DOWN">Input port down</option>
+                <option value="OUTPUT_PORT_DOWN">Output port down</option>
+              </select></label>
+              <label>Port<input id="fault-port" name="port" type="number" min="1" max="16" disabled /></label>
+              <div class="button-row">
+                <button id="fault-submit" type="submit" class="danger-button">Inject fault</button>
+                <button id="fault-clear" type="button" class="ghost-button">Clear all faults</button>
+              </div>
+            </form>
+            <p id="operation-status" class="operation-status" aria-live="polite">No pending operation.</p>
+            <h3>Active alarms</h3>
+            <div id="alarms" class="alarm-list"></div>
+          </article>
+        </section>
+
+        <section class="panel">
+          <div class="section-heading compact"><div><p class="eyebrow">signal edge</p><h2>Port state</h2></div></div>
+          <div class="ports-grid">
+            <div><h3>Input ports</h3><div id="input-ports" class="port-list"></div></div>
+            <div><h3>Output ports</h3><div id="output-ports" class="port-list"></div></div>
+          </div>
+        </section>
+
+        <section class="two-column telemetry-grid">
+          <article class="panel"><div class="section-heading compact"><div><p class="eyebrow">device metrics</p><h2>Counters</h2></div></div><dl id="counters" class="data-grid"></dl></article>
+          <article class="panel"><div class="section-heading compact"><div><p class="eyebrow">control-plane view</p><h2>Diagnostics</h2></div></div><dl id="diagnostics" class="data-grid"></dl></article>
+        </section>
+      </main>
+      <footer>Simulation UI · Set acceptance is not hardware confirmation · localhost development profile</footer>
+    </div>
+    <script type="module" src="/src/dashboard.ts"></script>
+  </body>
+</html>

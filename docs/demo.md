@@ -15,10 +15,11 @@ make demo
 ```
 
 The command builds and starts an isolated Compose project named
-`mini-ocs-nos-demo` on `127.0.0.1:50053`. It enables the default-closed
-development fault API only for that project. A cleanup trap removes its
-containers, networks, and volumes whether the run passes or fails. The normal
-`make up` stack and its data are not reused.
+`mini-ocs-nos-demo` on gNMI port `127.0.0.1:50053` and dashboard port
+`127.0.0.1:8083`. It enables the default-closed development fault API only for
+that project. A cleanup trap removes its containers, networks, and volumes
+whether the run passes or fails. The normal `make up` stack and its data are not
+reused.
 
 ## What the output proves
 
@@ -35,7 +36,8 @@ The numbered output performs these checks in order:
 6. `ocsctl fault clear --all` clears simulator faults, bounded orchestration
    retry restores the circuit to `ACTIVE`, and diagnostics report convergence;
 7. the captured ON_CHANGE notifications are printed; and
-8. the isolated packaged E2E suite runs and prints its pytest summary.
+8. the isolated packaged E2E suite runs its gNMI/HTTP pytest checks and real
+   Chromium dashboard workflow.
 
 Set acceptance and device confirmation remain visibly separate throughout the
 run. A fault command also returns only after syncd records its confirmed device
@@ -53,14 +55,15 @@ For concurrent or customized local runs:
 ```bash
 OCS_DEMO_PROJECT_NAME=my-ocs-demo \
 OCS_DEMO_GNMI_PORT=55053 \
+OCS_DEMO_WEB_PORT=58083 \
 OCS_DEMO_LOG_DIR=artifacts/my-demo \
 make demo
 ```
 
 `OCS_DEMO_RETRY_MS` changes the demo's bounded retry delay; its default is 3000
 milliseconds so the FAILED and alarm state remains observable before recovery.
-The nested E2E defaults to port 50052 and can use the documented `OCS_E2E_*`
-overrides if that port is occupied.
+The nested E2E defaults to gNMI port 50052 and web port 8082 and can use the
+documented `OCS_E2E_*` overrides if either port is occupied.
 
 ## Security boundary
 

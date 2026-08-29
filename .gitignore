@@ -11,6 +11,10 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
+/web/node_modules/
+/web/dist/
+/web/playwright-report/
+/web/test-results/
 
 # Local tooling and editor state
 /.cache/

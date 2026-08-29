@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := build
 
-.PHONY: bootstrap configure build cpp-test sanitizer-test sanitizer-integration-test generate-protos python-sync python-test lint test image up redis-test redis-integration-test e2e demo down
+.PHONY: bootstrap configure build cpp-test sanitizer-test sanitizer-integration-test generate-protos python-sync python-test web-sync web-build web-test lint test image up redis-test redis-integration-test e2e demo down
 
 bootstrap:
 	./scripts/bootstrap.sh
@@ -8,7 +8,7 @@ bootstrap:
 configure:
 	cmake --preset dev
 
-build: configure python-sync
+build: configure python-sync web-build
 	cmake --build --preset dev
 
 cpp-test: build
@@ -38,10 +38,19 @@ python-sync:
 python-test: python-sync
 	UV_CACHE_DIR=$${UV_CACHE_DIR:-/tmp/mini-ocs-uv-cache} uv run --frozen pytest
 
+web-sync:
+	npm ci --prefix web
+
+web-build: web-sync
+	npm run --prefix web build
+
+web-test: web-sync
+	npm run --prefix web test
+
 lint: python-sync
 	UV_CACHE_DIR=$${UV_CACHE_DIR:-/tmp/mini-ocs-uv-cache} uv run --frozen ruff check python
 
-test: cpp-test python-test lint
+test: cpp-test python-test web-test lint
 
 image:
 	docker compose build

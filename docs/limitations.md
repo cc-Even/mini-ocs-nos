@@ -19,8 +19,8 @@ production network operating system or hardware implementation.
 
 - Development gNMI is insecure: there is no TLS/mTLS, authentication,
   authorization, role separation, certificate rotation, or audit log.
-- Compose binds gNMI to localhost and keeps Redis internal. Changing those
-  bindings without adding security is unsupported.
+- Compose binds gNMI and the web dashboard to localhost and keeps Redis
+  internal. Changing those bindings without adding security is unsupported.
 - Redis persistence is a local named volume and is not configured for HA,
   encryption, authenticated remote access, backup, or disaster recovery.
 - Fault control is local test infrastructure and must not be exposed to an
@@ -36,11 +36,12 @@ production network operating system or hardware implementation.
 - Managed simulator faults cover next-apply timeout/error and input/output port
   DOWN. Out-of-band drift, crash points, and process restarts remain automated
   fixture controls; `ocs-hwsimctl` remains an internal local UDS helper.
-- `make demo` and the consolidated test report are implemented. The interactive
-  web gateway and dashboard remain Iterations 54 and 55; there is no current
-  web-development target.
+- The interactive dashboard is a local single-user visualization, not a
+  production console. It has no TLS, authorization, CSRF policy, multi-device
+  selection, saved preferences, or historical telemetry.
 - Logs are structured and collected on test failure, but there is no centralized
-  log service, metrics exporter, dashboard, tracing system, or alert receiver.
+  log service, metrics exporter, monitoring dashboard, tracing system, or alert
+  receiver.
 
 ## Availability and scale
 
