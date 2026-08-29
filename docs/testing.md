@@ -13,8 +13,8 @@ deadlines and polling rather than relying on one short fixed sleep.
 | `make sanitizer-test` | Non-Redis C++ suite with ASan/UBSan/leak detection | GCC or Clang |
 | `make sanitizer-integration-test` | Redis-dependent C++ suite with ASan/UBSan | Docker daemon |
 | `make image` | All pinned, non-root service image targets | Docker daemon |
-| `make up` | Complete dependency-gated runtime health | Docker daemon; localhost port 50051 |
-| `make e2e` | Fresh isolated Compose stack controlled only through gNMI | Docker daemon; localhost port 50052 by default |
+| `make up` | Complete dependency-gated runtime health | Docker daemon; localhost ports 50051 and 8080 |
+| `make e2e` | Fresh isolated Compose stack through gNMI and its web adapter | Docker daemon; ports 50052 and 8082 by default |
 | `make demo` | Guided operator flow, managed fault/recovery, diagnostics, and packaged E2E | Docker daemon; localhost ports 50053 and 50052 by default |
 
 Run `make down` after manual Compose use. The integration and E2E harnesses have

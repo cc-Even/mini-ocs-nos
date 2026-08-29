@@ -35,11 +35,12 @@ uv run --frozen ocsctl diagnostics show ocs0
 make down
 ```
 
-`make up` builds and starts Redis, `ocs-hwsim`, `ocs-orch`, `ocs-syncd`, and the
-gNMI server, then waits for their dependency-aware health checks. The default
-gNMI endpoint is `127.0.0.1:50051`. `make down` stops the services but preserves
-the named Redis volume; `docker compose down --volumes` also deletes local
-runtime data.
+`make up` builds and starts Redis, `ocs-hwsim`, `ocs-orch`, `ocs-syncd`, the
+gNMI server, and the separately packaged gNMI-only web gateway, then waits for
+their dependency-aware health checks. The default gNMI endpoint is
+`127.0.0.1:50051`; the bounded REST/WebSocket gateway is
+`http://127.0.0.1:8080`. `make down` stops the services but preserves the named
+Redis volume; `docker compose down --volumes` also deletes local runtime data.
 
 ### 中文快速开始
 
@@ -125,6 +126,10 @@ databases, versions, state transitions, and atomicity.
 - Polling detects out-of-band drift and port DOWN, raises alarms and counters,
   and reconciles with a complete desired snapshot.
 
+The browser gateway translates only to gNMI Get/Set/Subscribe and has no Redis
+or UDS access. Its HTTP `202` response retains the same desired-state admission
+semantics as gNMI Set. See the [web gateway contract](docs/web-gateway.md).
+
 The formal integration path uses `UdsDeviceBackend` and a standalone
 `ocs-hwsim`, and the reproducible operator demo uses the same path. Unit tests
 also keep `InProcessSimBackend` for fast, deterministic domain testing; it is
@@ -180,7 +185,7 @@ make test                         # C++/Python unit suites and Ruff
 make redis-integration-test       # real Redis + standalone service processes
 make sanitizer-test               # C++ unit suite under ASan/UBSan
 make sanitizer-integration-test   # Redis integration under ASan/UBSan
-make image                        # all four non-root service images
+make image                        # all five non-root service images
 make e2e                          # isolated full-Compose gNMI vertical slice
 make demo                         # guided operator flow plus packaged E2E
 ```
@@ -204,6 +209,7 @@ failure artifacts.
 - [Known limitations](docs/limitations.md)
 - [Redis state and event contract](docs/redis-schema.md)
 - [CLI workflows](docs/cli.md)
+- [Web gateway contract](docs/web-gateway.md)
 - [Development environment](docs/development-environment.md)
 - [Structured logging contract](docs/logging.md)
 - [Architecture decision records](docs/decisions/README.md)

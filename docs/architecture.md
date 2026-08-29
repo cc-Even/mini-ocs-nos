@@ -8,8 +8,11 @@ project-native.
 ## Component map
 
 ```text
-                        management network
-  ocsctl  <--- gNMI/JSON_IETF --->  gnmi-server (Python)
+                              management network
+  browser <-- HTTP/WebSocket --> web-gateway
+                                      | gNMI
+                                      v
+  ocsctl  <-------- gNMI/JSON_IETF --> gnmi-server (Python)
                                          |
                    +---------------------+---------------------+
                    | Redis snapshots and reliable Streams     |
@@ -31,15 +34,17 @@ project-native.
        standalone ocs-hwsim (C++20) -- simulated matrix/ports
 ```
 
-Compose exposes only the gNMI port, bound to `127.0.0.1` by default. Redis is on
-an internal network. syncd and hwsim share a named volume containing the UDS
-path; they do not communicate through an in-process shortcut.
+Compose exposes gNMI and the bounded web gateway, both bound to `127.0.0.1` by
+default. Redis is on an internal network. The gateway is exclusively a gNMI
+client and does not mount the UDS volume. syncd and hwsim share the named volume
+containing that path; they do not communicate through an in-process shortcut.
 
 ## Responsibilities
 
 | Component | Owns | Does not own |
 |---|---|---|
 | `ocsctl` | Human/JSON workflows, RPC deadlines, bounded watches | Redis keys, hardware state |
+| `web-gateway` | Bounded browser REST/WebSocket, gNMI translation and reconnect | Redis keys, UDS, hardware state |
 | `gnmi-server` | Capabilities/Get/Set/Subscribe, path and payload validation, atomic desired-state commit | Hardware apply success |
 | `ocs-orch` | Connection state machine, durable config/result consumption, retry policy, application state and timeout alarms | UDS or simulator calls |
 | `ocs-syncd` | Device command consumption, UDS calls, confirmed state/counters, generation refresh, drift/port reconciliation | Desired-state admission |
@@ -68,10 +73,10 @@ and durable desired-state persistence from asynchronous hardware confirmation.
 ## Process and language boundaries
 
 Python 3.12 handles protobuf generation, asynchronous gRPC, path/payload
-validation, Redis-backed management transactions, and the CLI. C++20 owns the
-state machine, orchestration, synchronization, device abstraction, UDS
-transport, and simulation. Redis event schemas and the UDS protocol are the
-explicit cross-language/process contracts.
+validation, Redis-backed management transactions, the CLI, and the separately
+packaged gNMI-only browser gateway. C++20 owns the state machine, orchestration,
+synchronization, device abstraction, UDS transport, and simulation. Redis event
+schemas, gNMI, and the UDS protocol are explicit process boundaries.
 
 This split is recorded in
 [ADR 0002](decisions/0002-python-gnmi-cpp-device-plane.md). Moving gNMI to C++

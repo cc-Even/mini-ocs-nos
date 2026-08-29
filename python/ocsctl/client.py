@@ -195,14 +195,20 @@ class GnmiClient:
             f"connection {device}/{connection_id} did not reach {apply_status}; last={actual}"
         )
 
-    async def subscribe(self, path: str) -> AsyncIterator[dict[str, Any]]:
-        request_path = protobuf_path(path)
+    async def subscribe(self, paths: str | Sequence[str]) -> AsyncIterator[dict[str, Any]]:
+        """Subscribe to one or more native paths on one bounded gNMI stream."""
+
+        requested_paths = (paths,) if isinstance(paths, str) else tuple(paths)
+        if not requested_paths:
+            raise ValueError("at least one subscription path is required")
+        request_paths = tuple(protobuf_path(path) for path in requested_paths)
 
         async def requests():
             yield gnmi_pb2.SubscribeRequest(
                 subscribe=gnmi_pb2.SubscriptionList(
                     subscription=[
-                        gnmi_pb2.Subscription(path=request_path, mode=gnmi_pb2.ON_CHANGE)
+                        gnmi_pb2.Subscription(path=path, mode=gnmi_pb2.ON_CHANGE)
+                        for path in request_paths
                     ],
                     mode=gnmi_pb2.SubscriptionList.STREAM,
                     encoding=gnmi_pb2.JSON_IETF,

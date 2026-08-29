@@ -8,28 +8,34 @@ version = "0.1.0"
 description = "Management-plane services and CLI for mini-ocs-nos"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "fastapi==0.116.1",
     "grpcio==1.74.0",
     "grpcio-tools==1.74.0",
     "protobuf==6.31.1",
     "pydantic==2.11.7",
     "redis==6.4.0",
     "typer==0.16.0",
+    "uvicorn==0.35.0",
+    "websockets==15.0.1",
 ]
 
 [project.scripts]
 gnmi-server = "gnmi_server.server:main"
 ocs-healthcheck = "gnmi_server.healthcheck:main"
+ocs-web-gateway = "web_gateway.server:main"
+ocs-web-healthcheck = "web_gateway.healthcheck:main"
 ocsctl = "ocsctl.main:app"
 
 [dependency-groups]
 dev = [
+    "httpx==0.28.1",
     "pytest==8.4.1",
     "pytest-asyncio==1.1.0",
     "ruff==0.12.9",
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["python/github", "python/gnmi_server", "python/ocsctl"]
+packages = ["python/github", "python/gnmi_server", "python/ocsctl", "python/web_gateway"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "proto/github.com/openconfig/gnmi/LICENSE" = "gnmi_server/licenses/openconfig-gnmi-LICENSE"

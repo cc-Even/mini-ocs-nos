@@ -58,3 +58,6 @@ ENTRYPOINT ["ocs-orch"]
 
 FROM runtime AS gnmi
 ENTRYPOINT ["gnmi-server"]
+
+FROM runtime AS gateway
+ENTRYPOINT ["ocs-web-gateway"]

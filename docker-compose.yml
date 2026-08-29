@@ -124,6 +124,31 @@ services:
       retries: 20
       start_period: 3s
 
+  web-gateway:
+    <<: *service-defaults
+    image: mini-ocs-web-gateway:${OCS_IMAGE_TAG:-local}
+    build:
+      context: .
+      target: gateway
+    command: ["--listen", "0.0.0.0:8080", "--gnmi-target", "gnmi-server:50051"]
+    environment:
+      OCS_WEB_GNMI_TARGET: gnmi-server:50051
+    depends_on:
+      gnmi-server:
+        condition: service_healthy
+        restart: true
+    ports:
+      - "127.0.0.1:${OCS_WEB_PORT:-8080}:8080"
+    networks:
+      - control-plane
+      - management
+    healthcheck:
+      test: ["CMD", "ocs-web-healthcheck", "--url", "http://127.0.0.1:8080/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
 networks:
   control-plane:
     internal: true
