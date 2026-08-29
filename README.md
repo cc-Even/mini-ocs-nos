@@ -1,5 +1,7 @@
 # mini-ocs-nos
 
+**English** | [中文](README.zh-CN.md)
+
 mini-ocs-nos is a **SONiC-inspired control-plane prototype for a simulated
 16×16 optical circuit switch (OCS)**. It separates desired configuration,
 orchestration, device commands, and confirmed operational state across
@@ -46,26 +48,9 @@ their dependency-aware health checks. The default gNMI endpoint is
 stops the services but preserves the named Redis volume; `docker compose down
 --volumes` also deletes local runtime data.
 
-### 中文快速开始
-
-请先安装 Linux/WSL2、Docker Engine 与 Compose、Git、GNU Make、CMake 3.25+、
-支持 C++20 的编译器，以及用于本地前端测试的 Node.js 22.12+，然后执行：
-
-```bash
-make bootstrap       # 安装固定版本的 uv/Python，并检查开发环境
-make build           # 构建 C++ 服务并同步 Python 依赖
-make up              # 构建镜像，启动全部服务并等待健康检查通过
-
-uv run --frozen ocsctl connection create ocs0 conn-001 --input 3 --output 11
-uv run --frozen ocsctl connection list ocs0
-uv run --frozen ocsctl diagnostics show ocs0
-
-make e2e             # 在隔离的 Compose 项目中运行端到端测试
-make down            # 停止默认环境；保留 Redis 命名卷
-```
-
-开发环境使用未加密、未认证的 gNMI，仅绑定到本机回环地址；不要把它暴露
-到不可信网络。Redis 只位于 Compose internal network，不是管理接口。
+Development gNMI is insecure and unauthenticated and binds only to the local
+loopback address. Do not expose it to an untrusted network. Redis remains on a
+Compose internal network and is not a management interface.
 
 ## What happens after a Set
 
@@ -220,6 +205,3 @@ failure artifacts.
 - [Structured logging contract](docs/logging.md)
 - [Architecture decision records](docs/decisions/README.md)
 - [Official gNMI protobuf provenance](proto/README.md)
-
-The authoritative product scope remains
-[`mini-ocs-network-os-development-spec.md`](mini-ocs-network-os-development-spec.md).
